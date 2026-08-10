@@ -1,0 +1,38 @@
+{
+  "llm": {
+    "provider": "anthropic",
+    "base_url": "",
+    "api_key_env": "ANTHROPIC_API_KEY",
+    "model": "claude-sonnet-5",
+    "temperature": 0.0,
+    "max_tokens": 8000,
+    "timeout": 120
+  },
+  "claude": {
+    "binary": "claude",
+    "model": "",
+    "permission_mode": "acceptEdits",
+    "allowed_tools": [],
+    "disallowed_tools": [],
+    "completion_idle": 5.0,
+    "extra_args": []
+  },
+  "codex": {
+    "binary": "codex",
+    "model": "",
+    "sandbox": "workspace-write",
+    "auto_approve": false,
+    "skip_git_check": true,
+    "full_trace": true,
+    "extra_args": []
+  },
+  "approval": {
+    "mode": "auto",
+    "default_allow": true,
+    "timeout": 120
+  },
+  "workspace_dir": "workspaces",
+  "report_dir": "reports",
+  "max_parallel": 2,
+  "timeout_per_task": 900
+}
