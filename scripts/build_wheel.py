@@ -34,7 +34,7 @@ PKG = ROOT / "tasker"
 DIST = ROOT / "dist"
 # 发布名（PyPI 唯一可用名；tasker/claude-codex-tasker 均被占用或不可用）
 NAME = "multicc"
-VERSION = "0.1.2"
+VERSION = "0.2.0"
 DIST_INFO = f"{NAME}-{VERSION}.dist-info"
 
 

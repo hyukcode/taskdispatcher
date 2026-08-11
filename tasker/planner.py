@@ -30,6 +30,23 @@ SYSTEM_PROMPT = """\
 - 只输出 JSON。id 从 t1 开始递增。executor 只能是 claude 或 codex。
 """
 
+# 模板顶层已知字段（这些字段有特殊处理逻辑，不会重复透传）
+_TPL_KNOWN_FIELDS = frozenset({
+    "template_name",
+    "source_file",
+    "system_prompt_extension",
+    "suggested_tasks",
+})
+
+# suggested_tasks 条目中的已知字段
+_TASK_KNOWN_FIELDS = frozenset({
+    "title",
+    "description",
+    "executor",
+    "depends_on",
+    "acceptance",
+})
+
 
 def _extract_json(text: str) -> dict:
     text = text.strip()
@@ -43,11 +60,34 @@ def _extract_json(text: str) -> dict:
     return json.loads(text[start : end + 1])
 
 
-def plan_with_llm(prompt: str, cfg: Config, emit) -> Plan:
-    """调用 LLM 拆分任务。emit 用于记录 planner 侧事件。"""
+def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) -> Plan:
+    """调用 LLM 拆分任务。emit 用于记录 planner 侧事件。
+
+    模板发现（无需手动 --template）：
+    1. 从 ~/.tasker/templates/ 读取已存储的模板目录
+    2. 将目录注入 system prompt，LLM 看到可用模板后自行决定参考哪个
+    3. 若显式传入 template，同时注入该模板的完整内容
+    """
+    sys_prompt = SYSTEM_PROMPT
+    user_content = f"目标：\n{prompt}"
+
+    # —— 自动发现模板目录 ——
+    catalog = _load_catalog()
+    if catalog:
+        sys_prompt += (
+            "\n\n## 可用模板目录\n"
+            "以下是本地已存储的任务拆解模板。如果当前目标与某个模板相关，"
+            "请参考其任务结构进行拆分（可以调整、合并或增删）：\n\n"
+            + catalog
+        )
+
+    # —— 显式模板：注入完整内容 ——
+    if template:
+        sys_prompt, user_content = _inject_template(sys_prompt, user_content, template)
+
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"目标：\n{prompt}"},
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": user_content},
     ]
     emit(Event(kind="interaction", source="planner", text="调用任务拆分 LLM（模型 " + cfg.llm.model + "）"))
     raw = chat(cfg.llm, messages, temperature=0.0)
@@ -81,6 +121,52 @@ def plan_with_llm(prompt: str, cfg: Config, emit) -> Plan:
     )
     _validate(plan)
     return plan
+
+
+def _load_catalog() -> str:
+    """从本地模板库读取目录摘要，供 LLM 决策使用。"""
+    try:
+        from template import catalog_for_llm
+
+        return catalog_for_llm()
+    except ImportError:
+        return ""
+    except Exception:
+        return ""
+
+
+def _inject_template(sys_prompt: str, user_content: str, template: dict) -> tuple[str, str]:
+    """将显式模板的完整内容注入 prompt。"""
+    ext = template.get("system_prompt_extension", "")
+    if ext:
+        sys_prompt = sys_prompt + "\n\n## 选中的模板详情\n" + ext[:3000]
+
+    suggested = template.get("suggested_tasks") or []
+    if suggested:
+        lines = ["\n\n## 参考模板（以下为建议的任务拆分，请以此为起点进行调整）"]
+        for i, t in enumerate(suggested, start=1):
+            lines.append(
+                f"{i}. [{t.get('executor', 'claude')}] {t.get('title', '')}"
+                f"  ← {', '.join(t.get('depends_on', [])) or '—'}"
+            )
+            desc = t.get("description", "")
+            if desc:
+                lines.append(f"   {desc[:300]}")
+            # —— 透传 suggested_tasks 中的未知字段 ——
+            extra = {k: v for k, v in t.items() if k not in _TASK_KNOWN_FIELDS}
+            if extra:
+                lines.append(f"   元信息: {json.dumps(extra, ensure_ascii=False)}")
+        user_content += "\n".join(lines)
+
+    # —— 透传：模板中的未知字段全部注入 system prompt ——
+    passthrough = {k: v for k, v in template.items() if k not in _TPL_KNOWN_FIELDS}
+    if passthrough:
+        sys_prompt += (
+            "\n\n## 模板附加元信息（透传字段）\n"
+            + json.dumps(passthrough, ensure_ascii=False, indent=2)[:2000]
+        )
+
+    return sys_prompt, user_content
 
 
 def _rule_split(prompt: str) -> list[SubTask]:

@@ -31,6 +31,7 @@ class Scheduler:
         self.approvals = ApprovalPolicy(cfg.approval)
         self._quit = threading.Event()
         self._active: dict[str, tuple] = {}  # task_id -> (runner, thread)
+        self._active_lock = threading.Lock()
         self._run_id = time.strftime("%Y%m%d-%H%M%S")
         self._raw_dir = self.cfg.workspace_path / self._run_id
 
@@ -38,11 +39,19 @@ class Scheduler:
     def _on_event(self, run: TaskRun, event: Event) -> None:
         self._raw_append(run, event)
         self.tui.emit(run, event)
+
         if event.kind == "permission_request":
-            runner = self._active.get(run.task.id, (None, None))[0]
+            # ask_console 模式：暂停其他 runner 的非关键输出，打印醒目横幅
+            if self.cfg.approval.mode == "ask_console":
+                self.tui.hold_for_approval()
+            with self._active_lock:
+                runner = self._active.get(run.task.id, (None, None))[0]
             # 使用 can_use_tool 自管理审批的 runner（如 SdkClaudeRunner）不再走 ApprovalPolicy
             if not getattr(runner, "self_handles_approval", False):
                 self.approvals.handle(run, event, emit=self._emit_decision, send_msg=self._sender(run, runner))
+        elif event.kind == "permission_result":
+            if self.tui.is_held:
+                self.tui.release_hold()
 
     def _emit_decision(self, run: TaskRun, event: Event) -> None:
         self._raw_append(run, event)
@@ -107,7 +116,8 @@ class Scheduler:
             time.sleep(0.1)
         # 清理仍在运行的 runner（如超时/被中断）
         for task in layer:
-            runner, _th = self._active.get(task.id, (None, None))
+            with self._active_lock:
+                runner, _th = self._active.get(task.id, (None, None))
             if runner is not None and runner.is_alive():
                 runner.stop()
 
@@ -122,13 +132,18 @@ class Scheduler:
             run.error = f"未知 executor: {task.executor}"
             return
         runner = runner_cls(self.cfg, run, str(workdir), self._on_event, self._prompt_for(task))
-        self._active[task.id] = (runner, threading.current_thread())
+        with self._active_lock:
+            self._active[task.id] = (runner, threading.current_thread())
         console.status_line("▶", f"启动 {task.id} [{task.executor}] {task.title}", "blue")
         try:
             runner.start()
             deadline = time.time() + self.cfg.timeout_per_task
             while not runner.is_done() and not self._quit.is_set():
-                if time.time() > deadline:
+                # 当 runner 等待审批时，不触发超时（用户可能正在决策）
+                pending = getattr(runner, "pending_approval_ids", None)
+                if pending:
+                    deadline = max(deadline, time.time() + 60)  # 每次检查续期 60s
+                elif time.time() > deadline:
                     run.status = "failed"
                     run.error = f"超时（{self.cfg.timeout_per_task:.0f}s）"
                     runner.stop()
@@ -150,7 +165,8 @@ class Scheduler:
         finally:
             runner.stop()
             run.ended_at = time.time()
-            self._active.pop(task.id, None)
+            with self._active_lock:
+                self._active.pop(task.id, None)
             if run.status == "success":
                 console.status_line("✓", f"{task.id} [{task.executor}] 完成（{run.duration:.1f}s, ${run.cost_usd:.4f}）", "green")
             else:
@@ -192,7 +208,9 @@ class Scheduler:
         if c in ("quit", "q", "exit"):
             console.warn("终止所有运行中的 agent…")
             self._quit.set()
-            for runner, _ in self._active.values():
+            with self._active_lock:
+                runners = list(self._active.values())
+            for runner, _ in runners:
                 runner.stop()
         elif c == "help":
             self.tui.print_raw(HELP)
@@ -221,7 +239,9 @@ class Scheduler:
         if not text:
             return
         matched: list[str] = []
-        for tid, (runner, _) in self._active.items():
+        with self._active_lock:
+            items = list(self._active.items())
+        for tid, (runner, _) in items:
             task = self.runs[tid].task
             if target == "all" or target == task.executor or target == tid or target == tid.lstrip("t"):
                 ok = runner.send_message(text)
@@ -229,7 +249,9 @@ class Scheduler:
                 if not ok:
                     console.dim(f"[{tid}] 消息未能注入（runner 当前不可注入或已结束）")
         if not matched:
-            console.warn(f"没有匹配的 agent（target={target}）。当前活跃: {[t for t in self._active]}")
+            with self._active_lock:
+                active_ids = list(self._active.keys())
+            console.warn(f"没有匹配的 agent（target={target}）。当前活跃: {active_ids}")
 
     def _decide_approval(self, arg: str, allowed: bool) -> None:
         req_id = arg or self._find_pending_approval_id()
@@ -237,33 +259,47 @@ class Scheduler:
             console.warn("当前没有待处理的审批请求")
             return
         # 优先路由到自管理审批的 runner（SdkClaudeRunner.can_use_tool 的等待）
-        for runner, _ in self._active.values():
+        with self._active_lock:
+            runners = list(self._active.values())
+        for runner, _ in runners:
             if hasattr(runner, "approval_respond") and runner.approval_respond(req_id, allowed):
+                self.tui.release_hold()
                 return
         ok = self.approvals.decide(req_id, allowed, emit=self._emit_decision, send_msg=self._last_sender())
+        if ok:
+            self.tui.release_hold()
         if not ok:
             console.warn(f"审批请求 {req_id} 已不在待处理列表（可能已由策略自动处理）")
 
     def _find_pending_approval_id(self) -> str:
-        # 优先找 SDK runner 自管理的待审批请求
-        for runner, _ in self._active.values():
+        with self._active_lock:
+            runners = list(self._active.values())
+        for runner, _ in runners:
             if hasattr(runner, "pending_approval_ids") and runner.pending_approval_ids:
                 return list(runner.pending_approval_ids)[-1]
         return next(reversed(list(self.approvals.pending)), "") if self.approvals.pending else ""
 
     def _finalize_task(self, arg: str) -> None:
         """:done [<taskid>] —— 手动收尾一个仍在等待的任务（关闭其 stdin 让进程退出）。"""
-        target = arg or (next(iter(self._active), "") if self._active else "")
-        runner, _th = self._active.get(target, (None, None))
+        with self._active_lock:
+            keys = list(self._active.keys())
+        target = arg or (keys[0] if keys else "")
+        with self._active_lock:
+            item = self._active.get(target)
+        runner, _th = item if item else (None, None)
         if runner is None:
-            console.warn(f"没有运行中的任务 {target or '?'}；活跃: {list(self._active)}")
+            with self._active_lock:
+                active_ids = list(self._active.keys())
+            console.warn(f"没有运行中的任务 {target or '?'}；活跃: {active_ids}")
             return
         if hasattr(runner, "finalize"):
             console.info(f"手动收尾 {target} …")
             runner.finalize()
 
     def _last_sender(self):
-        for tid, (runner, _) in self._active.items():
+        with self._active_lock:
+            items = list(self._active.items())
+        for tid, (runner, _) in items:
             run = self.runs.get(tid)
             if run:
                 return self._sender(run, runner)

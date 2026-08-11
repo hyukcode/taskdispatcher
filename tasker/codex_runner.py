@@ -23,6 +23,8 @@ _REASON_FIELDS = ("reasoning", "reasoning_content", "thinking", "chain_of_though
 
 class CodexRunner:
     source = "codex"
+    # 审批请求由本 runner 自行处理，调度器的 ApprovalPolicy 不要插手
+    self_handles_approval = True
 
     def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str):
         self.cfg = cfg
@@ -35,6 +37,8 @@ class CodexRunner:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._interactions: list[str] = []
+        # ask_console 模式：审批请求阻塞 pump，等待 CLI 用户 :allow/:deny
+        self._pending_approvals: dict[str, tuple] = {}  # req_id → (threading.Event, holder_dict)
 
     def build_args(self) -> list[str]:
         c = self.cfg.codex
@@ -70,6 +74,23 @@ class CodexRunner:
     def queued_messages(self) -> list[str]:
         return list(self._interactions)
 
+    @property
+    def pending_approval_ids(self) -> list[str]:
+        return list(self._pending_approvals.keys())
+
+    def approval_respond(self, req_id: str, allowed: bool) -> bool:
+        """调度器 :allow/:deny 送达：解除 pump 线程的阻塞等待。"""
+        item = self._pending_approvals.get(req_id)
+        if item is None:
+            return False
+        ev, holder = item
+        holder["allowed"] = allowed
+        try:
+            ev.set()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     def stop(self) -> None:
         self._stop.set()
         if self.channel:
@@ -88,6 +109,17 @@ class CodexRunner:
     def _emit(self, event: Event) -> None:
         self.run.events.append(event)
         self.on_event(self.run, event)
+
+    def _emit_decision(self, req_id: str, allowed: bool, note: str = "") -> None:
+        head = "批准" if allowed else "拒绝"
+        self._emit(
+            Event(
+                kind="permission_result",
+                source=self.source,
+                text=f"{head} {note} 请求 {req_id}".strip(),
+                data={"allowed": allowed, "id": req_id},
+            )
+        )
 
     def _pump(self) -> None:
         ch = self.channel
@@ -169,20 +201,37 @@ class CodexRunner:
             )
         elif t == "approval_request":
             tc = data.get("tool_call") or {}
-            self._emit(
-                Event(
-                    kind="permission_request",
-                    source=self.source,
-                    text=str(tc.get("name", "?")),
-                    data={
-                        "id": data.get("id"),
-                        "tool": tc.get("name"),
-                        "input": tc.get("input"),
-                        "sandbox": data.get("sandbox"),
-                        "request_data": data,
-                    },
-                )
+            req_id = str(data.get("id") or f"codex-{time.time()}")
+            req = Event(
+                kind="permission_request",
+                source=self.source,
+                text=str(tc.get("name", "?")),
+                data={
+                    "id": req_id,
+                    "tool": tc.get("name"),
+                    "input": tc.get("input"),
+                    "sandbox": data.get("sandbox"),
+                    "request_data": data,
+                },
             )
+            self._emit(req)
+
+            mode = self.cfg.approval.mode
+            if mode == "auto":
+                allowed = self.cfg.approval.default_allow
+                self._emit_decision(req_id, allowed, "auto 模式")
+            elif mode == "log":
+                self._emit_decision(req_id, False, "log 模式：仅记录，默认拒绝")
+            else:  # ask_console —— 阻塞 pump 等待 :allow/:deny
+                ev = threading.Event()
+                holder: dict = {"allowed": None}
+                self._pending_approvals[req_id] = (ev, holder)
+                got = ev.wait(timeout=self.cfg.approval.timeout)
+                self._pending_approvals.pop(req_id, None)
+                if got and holder["allowed"] is not None:
+                    self._emit_decision(req_id, holder["allowed"])
+                else:
+                    self._emit_decision(req_id, False, "审批超时，默认拒绝")
         elif t == "completed":
             self.run.output = str(data.get("result", "") or data.get("response", ""))
             self.run.exit_code = 0 if not data.get("is_error") else (data.get("error") or 1)

@@ -46,12 +46,14 @@ def _make_parser() -> argparse.ArgumentParser:
     r.add_argument("--report", action="store_true", help="结束后额外写一份 Markdown 报告")
     r.add_argument("--max-parallel", type=int, default=None)
     r.add_argument("--timeout", type=float, default=None, help="单任务超时秒数")
+    r.add_argument("--template", default=None, help="任务拆解模板文件路径（由 tasker-template 的 template extract 生成或任意项目文件）")
 
     pl = sub.add_parser("plan", help="打印拆分计划")
     pl.add_argument("prompt", nargs="?", default="")
     pl.add_argument("--mock", action="store_true")
     pl.add_argument("--plan-rules", action="store_true")
     pl.add_argument("--json", action="store_true", help="以 JSON 输出计划")
+    pl.add_argument("--template", default=None, help="任务拆解模板文件路径")
 
     a = sub.add_parser("attach", help="ptty attach 到交互 TUI（macOS/Linux）")
     a.add_argument("tool", choices=["claude", "codex"])
@@ -89,6 +91,7 @@ def cmd_run(args, cfg) -> int:
     tui = LiveTui(think_level=args.think, input_enabled=not args.no_input)
 
     # 计划：mock 或 plan-rules 用规则；否则调 LLM（失败时回退到规则拆分）
+    template = _load_template(args.template) if args.template else None
     if args.mock:
         cfg.mock = True
         plan = plan_with_rules(prompt)
@@ -96,7 +99,7 @@ def cmd_run(args, cfg) -> int:
         plan = plan_with_rules(prompt)
     else:
         try:
-            plan = plan_with_llm(prompt, cfg, emit=lambda e: tui.emit(None, e, "planner"))  # type: ignore[arg-type]
+            plan = plan_with_llm(prompt, cfg, emit=lambda e: tui.emit(None, e, "planner"), template=template)  # type: ignore[arg-type]
         except LLMError as e:
             console.warn(f"任务拆分 LLM 不可用（{e}），回退到规则拆分")
             plan = plan_with_rules(prompt)
@@ -125,6 +128,65 @@ def cmd_run(args, cfg) -> int:
         path = write_report(plan, runs, prompt, cfg.report_path)
         console.ok(f"报告已写入 {path}")
     return 0 if all(r.status == "success" for r in runs) else 1
+
+
+def _load_template(path: str) -> dict | None:
+    """从文件路径加载任务拆解模板。
+
+    支持两种格式：
+    1. tasker-template 生成的 JSON 模板（以 template_name / suggested_tasks 为 key）
+    2. planner 兼容的 JSON（以 objective / tasks 为 key）
+    3. 原始项目文件（自动通过 template 包的 extract_template 处理）
+    """
+    import os
+    from pathlib import Path
+
+    p = Path(path).expanduser().resolve()
+    if not p.exists():
+        console.warn(f"模板文件不存在: {p}")
+        return None
+
+    # 尝试用 tasker-template 包的 extract_template 处理
+    try:
+        from template import extract_template as _extract
+
+        tpl = _extract(str(p))
+        return tpl.to_dict()
+    except ImportError:
+        pass
+    except Exception as e:
+        console.warn(f"模板提取失败（{e}），回退到原始 JSON 解析")
+
+    # 回退：直接读取 JSON
+    try:
+        import json
+
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if "template_name" in data:
+            return data  # tasker-template 格式
+        if "objective" in data and "tasks" in data:
+            # planner JSON 格式 → 转换为 template 格式
+            items = [
+                {
+                    "title": t.get("title", ""),
+                    "description": t.get("description", ""),
+                    "executor": t.get("executor", "claude"),
+                    "depends_on": t.get("depends_on", []),
+                    "acceptance": t.get("acceptance", ""),
+                }
+                for t in data.get("tasks", [])
+            ]
+            return {
+                "template_name": data.get("objective", ""),
+                "source_file": str(p),
+                "system_prompt_extension": data.get("rationale", ""),
+                "suggested_tasks": items,
+            }
+        console.warn(f"模板 JSON 格式不兼容: {p}")
+        return None
+    except Exception as e:
+        console.warn(f"模板加载失败: {e}")
+        return None
 
 
 def _inject_mock_executor(cfg) -> None:
@@ -186,11 +248,12 @@ def _inject_codex_app_server(cfg) -> bool:
 
 def cmd_plan(args, cfg) -> int:
     prompt = _read_prompt(args.prompt)
+    template = _load_template(args.template) if getattr(args, "template", None) else None
     if args.mock or args.plan_rules:
         plan = plan_with_rules(prompt)
     else:
         try:
-            plan = plan_with_llm(prompt, cfg, emit=lambda e: console.dim(f"[planner] {e.text}"))
+            plan = plan_with_llm(prompt, cfg, emit=lambda e: console.dim(f"[planner] {e.text}"), template=template)
         except LLMError as e:
             console.warn(f"任务拆分 LLM 不可用（{e}），回退到规则拆分")
             plan = plan_with_rules(prompt)
