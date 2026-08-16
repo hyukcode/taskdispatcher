@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multicc"
-version = "0.2.0"
+version = "0.5.4"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
-dependencies = ["claude-agent-sdk"]
+dependencies = ["claude-agent-sdk", "tp-wy>=0.2.0"]
 
 [project.scripts]
 tasker = "tasker.main:main"

@@ -139,14 +139,25 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
     return cfg
 
 
+def _user_config_path() -> Path:
+    """用户级配置：~/.tasker/config.json（与模板库 ~/.tasker/templates/ 同级，不依赖当前目录）。"""
+    return Path(os.path.expanduser("~")) / ".tasker" / "config.json"
+
+
 def load_config(path: str | Path | None = None, *, overrides: dict[str, Any] | None = None) -> Config:
-    """加载配置文件。缺省顺序：./config.json（当前目录）→ 包目录 config.json → 内置默认值。overrides 优先于文件。"""
+    """加载配置文件。缺省顺序（取第一个存在的文件）：
+    1. --config 显式指定
+    2. ./config.json（当前目录，便于项目级覆盖）
+    3. ~/.tasker/config.json（用户级，任意目录下都生效）
+    4. 包目录 config.json
+    5. 内置默认值
+    overrides 优先于文件。"""
     cfg = Config()
     if path:
         p = Path(path)
     else:
-        cwd_cfg = Path.cwd() / "config.json"
-        p = cwd_cfg if cwd_cfg.exists() else ROOT / "config.json"
+        candidates = [Path.cwd() / "config.json", _user_config_path(), ROOT / "config.json"]
+        p = next((c for c in candidates if c.exists()), ROOT / "config.json")
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))

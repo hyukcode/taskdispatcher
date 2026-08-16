@@ -173,9 +173,9 @@ class Scheduler:
                 console.status_line("✗", f"{task.id} [{task.executor}] {run.status}: {run.error or '见上方输出'}", "red")
 
     def _task_workdir(self, task) -> Path:
-        base = self._raw_dir / task.id
-        base.mkdir(parents=True, exist_ok=True)
-        return base
+        """所有 task 共享同一个工作区目录，使前置任务的产物对后续任务直接可见。"""
+        self._raw_dir.mkdir(parents=True, exist_ok=True)
+        return self._raw_dir
 
     def _prompt_for(self, task) -> str:
         parts = [f"任务 {task.id}: {task.title}", task.description]
@@ -184,6 +184,13 @@ class Scheduler:
         deps = [self.runs[d].output for d in task.depends_on if d in self.runs and self.runs[d].output]
         if deps:
             parts.append("\n依赖任务输出（作为上下文）：\n" + "\n---\n".join(deps)[:8000])
+        # 告知当前任务：前置任务的文件产物就在当前工作目录中（共享工作区）
+        dep_ids = [d for d in task.depends_on if d in self.runs and self.runs[d].status == "success"]
+        if dep_ids:
+            parts.append(
+                "\n注意：前置任务 (" + ", ".join(dep_ids) + ") 的文件产物已落在当前工作目录中，"
+                "请直接读取使用，无需重复生成。"
+            )
         return "\n\n".join(parts)
 
     # ---------------- 用户输入路由 ----------------
@@ -315,4 +322,4 @@ class Scheduler:
                 "审批": len([e for e in run.events if e.kind in ("permission_request", "permission_result")]),
                 "注入消息": len([e for e in run.events if e.kind == "user_message"]),
             }
-            print(f"  {tid} [{run.task.executor}] {run.status:<8} {run.duration:6.1f}s ${run.cost_usd:.4f}  {stats}")
+            self.tui.print_raw(f"  {tid} [{run.task.executor}] {run.status:<8} {run.duration:6.1f}s ${run.cost_usd:.4f}  {stats}")

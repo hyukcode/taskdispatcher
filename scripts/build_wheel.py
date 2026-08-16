@@ -34,7 +34,7 @@ PKG = ROOT / "tasker"
 DIST = ROOT / "dist"
 # 发布名（PyPI 唯一可用名；tasker/claude-codex-tasker 均被占用或不可用）
 NAME = "multicc"
-VERSION = "0.2.0"
+VERSION = "0.5.4"
 DIST_INFO = f"{NAME}-{VERSION}.dist-info"
 
 
@@ -43,6 +43,9 @@ def _metadata() -> str:
     lines = ["Metadata-Version: 2.1", f"Name: {NAME}", f"Version: {VERSION}"]
     lines.append("Requires-Python: >=3.9")
     lines.append("License: MIT")
+    # 运行时依赖必须声明，否则 pip 从 PyPI 安装时不会自动拉取（尤其 tp-wy 模板包）
+    lines.append("Requires-Dist: claude-agent-sdk")
+    lines.append("Requires-Dist: tp-wy (>=0.2.0)")
     return "\n".join(lines) + "\n"
 
 WHEEL = """\
@@ -83,6 +86,11 @@ def build() -> Path:
             data = (ROOT / rel.replace("/", os.sep)).read_bytes()
             records.append((rel, _hash(data), str(len(data))))
             zf.writestr(rel, data)
+        # 注入版本号文件（安装后 __init__.py 优先读它，避免读不到 pyproject.toml 而显示 0.0.0）
+        ver_rel = "tasker/_version.py"
+        ver_data = f'__version__ = "{VERSION}"\n'.encode("utf-8")
+        records.append((ver_rel, _hash(ver_data), str(len(ver_data))))
+        zf.writestr(ver_rel, ver_data)
         # dist-info 元数据
         for name, content in [
             ("METADATA", _metadata()),

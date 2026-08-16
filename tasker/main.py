@@ -46,14 +46,14 @@ def _make_parser() -> argparse.ArgumentParser:
     r.add_argument("--report", action="store_true", help="结束后额外写一份 Markdown 报告")
     r.add_argument("--max-parallel", type=int, default=None)
     r.add_argument("--timeout", type=float, default=None, help="单任务超时秒数")
-    r.add_argument("--template", default=None, help="任务拆解模板文件路径（由 tasker-template 的 template extract 生成或任意项目文件）")
+    r.add_argument("--template", default=None, help="任务拆解模板名称（从 tasker-template 模板库查找，也兼容文件路径）")
 
     pl = sub.add_parser("plan", help="打印拆分计划")
     pl.add_argument("prompt", nargs="?", default="")
     pl.add_argument("--mock", action="store_true")
     pl.add_argument("--plan-rules", action="store_true")
     pl.add_argument("--json", action="store_true", help="以 JSON 输出计划")
-    pl.add_argument("--template", default=None, help="任务拆解模板文件路径")
+    pl.add_argument("--template", default=None, help="任务拆解模板名称（从 tasker-template 模板库查找，也兼容文件路径）")
 
     a = sub.add_parser("attach", help="ptty attach 到交互 TUI（macOS/Linux）")
     a.add_argument("tool", choices=["claude", "codex"])
@@ -91,18 +91,18 @@ def cmd_run(args, cfg) -> int:
     tui = LiveTui(think_level=args.think, input_enabled=not args.no_input)
 
     # 计划：mock 或 plan-rules 用规则；否则调 LLM（失败时回退到规则拆分）
-    template = _load_template(args.template) if args.template else None
+    template = _load_template(args.template) if args.template else _auto_match_template(prompt)
     if args.mock:
         cfg.mock = True
-        plan = plan_with_rules(prompt)
+        plan = plan_with_rules(prompt, template=template)
     elif args.plan_rules:
-        plan = plan_with_rules(prompt)
+        plan = plan_with_rules(prompt, template=template)
     else:
         try:
             plan = plan_with_llm(prompt, cfg, emit=lambda e: tui.emit(None, e, "planner"), template=template)  # type: ignore[arg-type]
         except LLMError as e:
             console.warn(f"任务拆分 LLM 不可用（{e}），回退到规则拆分")
-            plan = plan_with_rules(prompt)
+            plan = plan_with_rules(prompt, template=template)
 
     if args.mock:
         _inject_mock_executor(cfg)
@@ -130,15 +130,44 @@ def cmd_run(args, cfg) -> int:
     return 0 if all(r.status == "success" for r in runs) else 1
 
 
-def _load_template(path: str) -> dict | None:
-    """从文件路径加载任务拆解模板。
+def _load_template(name: str) -> dict | None:
+    """从模板名称加载任务拆解模板（通过 tasker-template 包）。
 
-    支持两种格式：
+    兼容旧用法：如果 name 看起来像文件路径（含路径分隔符或 .json 后缀），
+    回退到从文件加载。
+    """
+    import os
+
+    # 如果像文件路径，回退到文件加载（兼容旧用法）
+    if os.sep in name or "/" in name or name.endswith(".json"):
+        return _load_template_from_file(name)
+
+    # 按名称从模板库查找
+    try:
+        from template import get_template
+
+        tpl = get_template(name)
+        if tpl:
+            return tpl
+        console.warn(f"模板库中未找到模板: {name}")
+        return None
+    except ImportError:
+        console.warn("tasker-template 包未安装，无法按名称查找模板")
+        return None
+    except Exception as e:
+        console.warn(f"模板查找失败: {e}")
+        return None
+
+
+def _load_template_from_file(path: str) -> dict | None:
+    """从文件路径加载任务拆解模板（兼容旧用法）。
+
+    支持三种格式：
     1. tasker-template 生成的 JSON 模板（以 template_name / suggested_tasks 为 key）
     2. planner 兼容的 JSON（以 objective / tasks 为 key）
     3. 原始项目文件（自动通过 template 包的 extract_template 处理）
     """
-    import os
+    import os as _os
     from pathlib import Path
 
     p = Path(path).expanduser().resolve()
@@ -170,8 +199,6 @@ def _load_template(path: str) -> dict | None:
                 {
                     "title": t.get("title", ""),
                     "description": t.get("description", ""),
-                    "executor": t.get("executor", "claude"),
-                    "depends_on": t.get("depends_on", []),
                     "acceptance": t.get("acceptance", ""),
                 }
                 for t in data.get("tasks", [])
@@ -187,6 +214,45 @@ def _load_template(path: str) -> dict | None:
     except Exception as e:
         console.warn(f"模板加载失败: {e}")
         return None
+
+
+def _auto_match_template(prompt: str) -> dict | None:
+    """根据 prompt 关键词自动匹配本地模板库中的模板。
+
+    匹配逻辑：将 prompt 拆成词（中英文），在模板名称和 tags 中查找。
+    返回第一个匹配到的模板，未匹配到返回 None。
+    """
+    try:
+        from template import search_templates, get_template
+    except ImportError:
+        return None
+
+    # 提取关键词：中文字符 + 英文单词
+    import re
+
+    keywords = set()
+    # 中文：连续的 CJK 字符
+    for m in re.finditer(r"[一-鿿㐀-䶿]+", prompt):
+        keywords.add(m.group())
+    # 英文：取 3 字母以上的单词
+    for m in re.finditer(r"[a-zA-Z]{3,}", prompt):
+        keywords.add(m.group().lower())
+
+    if not keywords:
+        return None
+
+    # 用 search_templates 依次搜索每个关键词
+    seen: set[str] = set()
+    for kw in keywords:
+        results = search_templates(keyword=kw)
+        for info in results or []:
+            name = info.get("name", "")
+            if name and name not in seen:
+                seen.add(name)
+                tpl = get_template(name)
+                if tpl:
+                    return tpl
+    return None
 
 
 def _inject_mock_executor(cfg) -> None:
@@ -210,7 +276,6 @@ def _inject_sdk_executor() -> bool:
     from .sdk_runner import SdkClaudeRunner
 
     sched_mod.EXECUTOR_TO_RUNNER["claude"] = SdkClaudeRunner
-    console.info("claude 使用官方 claude-agent-sdk 后端（headless 审批可用）")
     return True
 
 
@@ -242,21 +307,20 @@ def _inject_codex_app_server(cfg) -> bool:
     from .codex_app_server_runner import CodexAppServerRunner
 
     sched_mod.EXECUTOR_TO_RUNNER["codex"] = CodexAppServerRunner
-    console.info("codex 使用 app-server JSON-RPC 后端（审批可交互、支持中途注入）")
     return True
 
 
 def cmd_plan(args, cfg) -> int:
     prompt = _read_prompt(args.prompt)
-    template = _load_template(args.template) if getattr(args, "template", None) else None
+    template = _load_template(args.template) if args.template else _auto_match_template(prompt)
     if args.mock or args.plan_rules:
-        plan = plan_with_rules(prompt)
+        plan = plan_with_rules(prompt, template=template)
     else:
         try:
             plan = plan_with_llm(prompt, cfg, emit=lambda e: console.dim(f"[planner] {e.text}"), template=template)
         except LLMError as e:
             console.warn(f"任务拆分 LLM 不可用（{e}），回退到规则拆分")
-            plan = plan_with_rules(prompt)
+            plan = plan_with_rules(prompt, template=template)
     if args.json:
         print(
             json.dumps(
@@ -315,7 +379,17 @@ def cmd_verify(args, cfg) -> int:
 
 
 def cmd_init(args, cfg) -> int:
-    path = args.config or "config.json"
+    from pathlib import Path
+
+    from .config import _user_config_path
+
+    if args.config:
+        path = args.config
+    else:
+        # 默认写入用户级配置 ~/.tasker/config.json，避免配置跟随当前目录
+        p = _user_config_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        path = str(p)
     if os.path.exists(path):
         console.warn(f"{path} 已存在，跳过")
     else:

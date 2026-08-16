@@ -57,8 +57,14 @@ def paint(text: str, *styles: str) -> str:
     return f"{codes}{text}{_C['reset']}"
 
 
+_write_hook = None  # callable(text) → 输出到 TUI；由 LiveTui 注册
+
+
 def _out(text: str, stream=None, **kw) -> None:
     """统一出口：flush，保证管道/重定向下实时可见。"""
+    if _write_hook is not None and stream is None:
+        _write_hook(text)
+        return
     (stream or sys.stdout).write(text + "\n")
     (stream or sys.stdout).flush()
 

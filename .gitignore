@@ -4,3 +4,5 @@ workspaces/
 reports/
 *.events.jsonl
 .DS_Store
+dist/
+*.egg-info/

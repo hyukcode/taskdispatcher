@@ -71,15 +71,16 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
     sys_prompt = SYSTEM_PROMPT
     user_content = f"目标：\n{prompt}"
 
-    # —— 自动发现模板目录 ——
-    catalog = _load_catalog()
-    if catalog:
-        sys_prompt += (
-            "\n\n## 可用模板目录\n"
-            "以下是本地已存储的任务拆解模板。如果当前目标与某个模板相关，"
-            "请参考其任务结构进行拆分（可以调整、合并或增删）：\n\n"
-            + catalog
-        )
+    # —— 自动发现模板目录（仅在未显式指定模板时注入） ——
+    if not template:
+        catalog = _load_catalog()
+        if catalog:
+            sys_prompt += (
+                "\n\n## 可用模板目录\n"
+                "以下是本地已存储的任务拆解模板。如果当前目标与某个模板相关，"
+                "请参考其任务结构进行拆分（可以调整、合并或增删）：\n\n"
+                + catalog
+            )
 
     # —— 显式模板：注入完整内容 ——
     if template:
@@ -136,36 +137,59 @@ def _load_catalog() -> str:
 
 
 def _inject_template(sys_prompt: str, user_content: str, template: dict) -> tuple[str, str]:
-    """将显式模板的完整内容注入 prompt。"""
-    ext = template.get("system_prompt_extension", "")
-    if ext:
-        sys_prompt = sys_prompt + "\n\n## 选中的模板详情\n" + ext[:3000]
+    """将模板完整内容统一注入 system prompt，使用强约束指令确保 LLM 遵循模板结构。
 
+    修复要点（相比旧实现）：
+    - 所有模板信息统一放在 sys_prompt（不在 user_content），确保指令权重
+    - suggested_tasks 格式接近输出 JSON schema，降低 LLM 的跨格式映射成本
+    - 措辞从"参考/建议"升级为"必须严格遵循"，禁止增删任务
+    - 模板内容合并为一个连贯块，不再碎片化到三处
+    - executor 与 depends_on 由 LLM 根据任务性质自行决定（模板不再指定）
+    """
+    import json as _json
+
+    tpl_name = template.get("template_name", "未命名模板")
+    ext = template.get("system_prompt_extension", "")
     suggested = template.get("suggested_tasks") or []
+    passthrough = {k: v for k, v in template.items() if k not in _TPL_KNOWN_FIELDS}
+
+    parts = [f"## 必用模板：{tpl_name}"]
+
+    if ext:
+        parts.append(f"\n### 模板说明\n{ext[:2000]}")
+
     if suggested:
-        lines = ["\n\n## 参考模板（以下为建议的任务拆分，请以此为起点进行调整）"]
+        parts.append("\n### 模板任务清单（必须严格遵循，任务数量与标题不得增删）")
         for i, t in enumerate(suggested, start=1):
-            lines.append(
-                f"{i}. [{t.get('executor', 'claude')}] {t.get('title', '')}"
-                f"  ← {', '.join(t.get('depends_on', [])) or '—'}"
-            )
+            tid = t.get("id", f"t{i}")
+            title = t.get("title", "")
             desc = t.get("description", "")
-            if desc:
-                lines.append(f"   {desc[:300]}")
-            # —— 透传 suggested_tasks 中的未知字段 ——
+            acceptance = t.get("acceptance", "")
+            parts.append(
+                f"  {tid}: {title}\n"
+                f"    描述: {desc[:500]}\n"
+                f"    验收: {acceptance or '—'}"
+            )
+            # 透传 suggested_tasks 中的未知字段
             extra = {k: v for k, v in t.items() if k not in _TASK_KNOWN_FIELDS}
             if extra:
-                lines.append(f"   元信息: {json.dumps(extra, ensure_ascii=False)}")
-        user_content += "\n".join(lines)
+                parts.append(f"    元信息: {_json.dumps(extra, ensure_ascii=False)}")
 
-    # —— 透传：模板中的未知字段全部注入 system prompt ——
-    passthrough = {k: v for k, v in template.items() if k not in _TPL_KNOWN_FIELDS}
     if passthrough:
-        sys_prompt += (
-            "\n\n## 模板附加元信息（透传字段）\n"
-            + json.dumps(passthrough, ensure_ascii=False, indent=2)[:2000]
+        parts.append(
+            f"\n### 模板附加约束\n{_json.dumps(passthrough, ensure_ascii=False, indent=2)[:1500]}"
         )
 
+    # 强约束指令（放在最后，利用 LLM 对末尾指令的 recency bias）
+    parts.append(
+        "\n**重要约束：你必须以上述模板的任务清单为蓝本进行拆分，保留每个任务的标题与"
+        "核心描述含义不变，禁止增删任务。**\n"
+        "**模板不指定 executor（由 claude 还是 codex 执行）与 depends_on（任务间依赖）："
+        "请你根据每个任务的性质（如代码实现、测试、调研等）自行分配合适的 executor，"
+        "并根据任务间的逻辑先后关系自行填写 depends_on。**"
+    )
+
+    sys_prompt += "\n\n" + "\n".join(parts)
     return sys_prompt, user_content
 
 
@@ -221,12 +245,47 @@ def _rule_split(prompt: str) -> list[SubTask]:
     return tasks
 
 
-def plan_with_rules(prompt: str) -> Plan:
+def plan_with_rules(prompt: str, template: dict | None = None) -> Plan:
+    """规则拆分：优先使用模板的 suggested_tasks，否则用内置规则。"""
+    if template and template.get("suggested_tasks"):
+        return _plan_from_template(prompt, template)
     tasks = _rule_split(prompt)
     return Plan(
         objective=prompt[:120],
         rationale="规则拆分（未调用 LLM）",
         tasks=tasks,
+        raw_llm_output="",
+    )
+
+
+def _plan_from_template(prompt: str, template: dict) -> Plan:
+    """用模板的 suggested_tasks 构建计划。"""
+    suggested = template["suggested_tasks"]
+    tasks: list[SubTask] = []
+    # 第一遍：收集 id，建立 id→index 映射
+    id_set: set[str] = set()
+    for i, t in enumerate(suggested):
+        tid = str(t.get("id") or f"t{i + 1}")
+        id_set.add(tid)
+    # 第二遍：构建 SubTask，处理 depends_on
+    for i, t in enumerate(suggested):
+        tid = str(t.get("id") or f"t{i + 1}")
+        executor = t.get("executor", "claude")
+        if executor not in ("claude", "codex"):
+            executor = "claude"
+        deps = [d for d in (t.get("depends_on") or []) if d in id_set]
+        tasks.append(SubTask(
+            id=tid,
+            title=str(t.get("title") or tid),
+            description=str(t.get("description") or t.get("title", "")),
+            executor=executor,
+            depends_on=deps,
+            acceptance=str(t.get("acceptance") or ""),
+        ))
+    return Plan(
+        objective=template.get("template_name") or prompt[:120],
+        rationale=f"模板拆分（来源: {template.get('source_file', '?')}）",
+        tasks=tasks or _rule_split(prompt),
         raw_llm_output="",
     )
 
