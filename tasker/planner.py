@@ -15,7 +15,7 @@ from .models import Event, Plan, SubTask
 
 SYSTEM_PROMPT = """\
 你是一个多智能体任务编排器。用户会给你一个目标，请把它拆分为若干个可并行/串行的子任务，
-并分派给 claude（擅长代码实现、文件编辑、整体工程）或 codex（擅长推理、测试、批处理）。
+并分派给 claude（擅长代码实现、文件编辑、整体工程）、codex（擅长推理、测试、批处理）或 human（人工审查点）。
 要求：
 - 每个子任务依赖其它子任务时，用 depends_on 声明（引用其它任务的 id）。
 - 让互相独立的子任务尽量并行（分给不同的 executor）。
@@ -23,11 +23,20 @@ SYSTEM_PROMPT = """\
 {
   "objective": "目标一句话",
   "rationale": "为什么这样拆分，一句话",
+  "template": "使用的模板名（未使用模板则为 null）",
   "tasks": [
-    {"id":"t1","title":"…","description":"详细指令，可被单独交给一个 agent 执行","executor":"claude|codex","depends_on":[],"acceptance":"完成标准"}
+    {"id":"t1","title":"…","description":"详细指令，可被单独交给一个 agent 执行","executor":"claude|codex|human","depends_on":[],"acceptance":"完成标准"}
   ]
 }
-- 只输出 JSON。id 从 t1 开始递增。executor 只能是 claude 或 codex。
+- 只输出 JSON。id 从 t1 开始递增。
+
+人工审查点（executor:"human"）识别规则：
+若某一步骤满足以下任一条件，应把其 executor 设为 "human"（人工审查点，会阻塞等待用户决定）：
+1. 涉及对外发布、部署到生产、提交到主分支、删除数据等不可逆/高风险操作；
+2. 关键决策点（技术选型、方案定稿、是否上线的拍板）；
+3. 需要人核对产出是否正确/是否符合预期（最终验收、内容审校、上线前检查）。
+其它步骤在 claude / codex 中二选一。human 步骤的 description 写清「审查什么」，
+acceptance 写清「通过标准」。
 """
 
 # 模板顶层已知字段（这些字段有特殊处理逻辑，不会重复透传）
@@ -101,7 +110,7 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
             tid = f"t{i}"
         seen.add(tid)
         executor = t.get("executor", "claude")
-        if executor not in ("claude", "codex"):
+        if executor not in ("claude", "codex", "human"):
             executor = "claude"
         deps = [d for d in (t.get("depends_on") or []) if isinstance(d, str) and d in seen]
         tasks.append(
@@ -114,11 +123,18 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
                 acceptance=str(t.get("acceptance") or ""),
             )
         )
+    # LLM 自选模板名（未选则 None）
+    tpl_name = data.get("template")
+    if not isinstance(tpl_name, str) or not tpl_name.strip() or tpl_name.lower() == "null":
+        tpl_name = None
+    else:
+        tpl_name = tpl_name.strip()
     plan = Plan(
         objective=str(data.get("objective") or prompt[:120]),
         rationale=str(data.get("rationale") or ""),
         tasks=tasks,
         raw_llm_output=raw,
+        template=tpl_name,
     )
     _validate(plan)
     return plan
@@ -271,7 +287,7 @@ def _plan_from_template(prompt: str, template: dict) -> Plan:
     for i, t in enumerate(suggested):
         tid = str(t.get("id") or f"t{i + 1}")
         executor = t.get("executor", "claude")
-        if executor not in ("claude", "codex"):
+        if executor not in ("claude", "codex", "human"):
             executor = "claude"
         deps = [d for d in (t.get("depends_on") or []) if d in id_set]
         tasks.append(SubTask(
@@ -294,7 +310,7 @@ def _validate(plan: Plan) -> None:
     """校验依赖引用、executor 合法性、环检测。"""
     ids = {t.id for t in plan.tasks}
     for t in plan.tasks:
-        if t.executor not in ("claude", "codex"):
+        if t.executor not in ("claude", "codex", "human"):
             raise LLMError(f"任务 {t.id} 的 executor 非法: {t.executor}")
         for d in t.depends_on:
             if d not in ids:

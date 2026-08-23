@@ -67,11 +67,64 @@ class ApprovalConfig:
 
 
 @dataclass
+class DispatchConfig:
+    """任务分派策略。"""
+
+    # 真实节点数小于该值且无 human 节点 / 无 loop 时，折叠为单 agent 直接执行
+    min_multiagent_steps: int = 3
+
+
+@dataclass
+class GoalLoopConfig:
+    """外层收敛循环配置。"""
+
+    max_iterations: int = 5  # 超限回 REPL 让用户决定（/continue /stop /replan）
+    evaluator: str = "claude"  # goal 达成判定的 code agent
+
+
+@dataclass
+class TemplateCompilerConfig:
+    """模板编译配置。"""
+
+    loop_infer: str = "llm"  # llm | off（off 时退化为线性 DAG，不调 LLM）
+    cache: bool = True  # 编译结果缓存，二次编译不重复调 LLM
+
+
+@dataclass
+class DisplayConfig:
+    """REPL 显示级别。"""
+
+    level: str = "minimal"  # minimal | verbose
+
+
+@dataclass
+class SessionConfig:
+    """会话持久化配置。"""
+
+    dir: str = "~/.tasker/sessions"
+    # 共享工作目录：固定到 ~/.tasker/ 下（和 config.json 一样用户级固定，不随 cwd/session 变化）
+    workspace_dir: str = "~/.tasker/workspace"
+
+    @property
+    def path(self) -> Path:
+        return Path(self.dir).expanduser()
+
+    @property
+    def workspace_path(self) -> Path:
+        return Path(self.workspace_dir).expanduser()
+
+
+@dataclass
 class Config:
     llm: LLMConfig = field(default_factory=LLMConfig)
     claude: ClaudeConfig = field(default_factory=ClaudeConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
     approval: ApprovalConfig = field(default_factory=ApprovalConfig)
+    dispatch: DispatchConfig = field(default_factory=DispatchConfig)
+    goal_loop: GoalLoopConfig = field(default_factory=GoalLoopConfig)
+    template_compiler: TemplateCompilerConfig = field(default_factory=TemplateCompilerConfig)
+    display: DisplayConfig = field(default_factory=DisplayConfig)
+    session: SessionConfig = field(default_factory=SessionConfig)
     workspace_dir: str = "workspaces"
     report_dir: str = "reports"
     max_parallel: int = 2
@@ -130,6 +183,29 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
         cfg.approval.mode = d.get("mode", cfg.approval.mode)
         cfg.approval.default_allow = bool(d.get("default_allow", cfg.approval.default_allow))
         cfg.approval.timeout = float(d.get("timeout", cfg.approval.timeout))
+
+    if "dispatch" in data:
+        d = data["dispatch"]
+        cfg.dispatch.min_multiagent_steps = int(d.get("min_multiagent_steps", cfg.dispatch.min_multiagent_steps))
+
+    if "goal_loop" in data:
+        d = data["goal_loop"]
+        cfg.goal_loop.max_iterations = int(d.get("max_iterations", cfg.goal_loop.max_iterations))
+        cfg.goal_loop.evaluator = d.get("evaluator", cfg.goal_loop.evaluator)
+
+    if "template_compiler" in data:
+        d = data["template_compiler"]
+        cfg.template_compiler.loop_infer = d.get("loop_infer", cfg.template_compiler.loop_infer)
+        cfg.template_compiler.cache = bool(d.get("cache", cfg.template_compiler.cache))
+
+    if "display" in data:
+        d = data["display"]
+        cfg.display.level = d.get("level", cfg.display.level)
+
+    if "session" in data:
+        d = data["session"]
+        cfg.session.dir = d.get("dir", cfg.session.dir)
+        cfg.session.workspace_dir = d.get("workspace_dir", cfg.session.workspace_dir)
 
     cfg.workspace_dir = data.get("workspace_dir", cfg.workspace_dir)
     cfg.report_dir = data.get("report_dir", cfg.report_dir)
@@ -201,6 +277,11 @@ def save_example_config(path: str | Path) -> None:
             "completion_idle": 5.0,
         },
         "approval": {"mode": "auto", "default_allow": True, "timeout": 120},
+        "dispatch": {"min_multiagent_steps": 3},
+        "goal_loop": {"max_iterations": 5, "evaluator": "claude"},
+        "template_compiler": {"loop_infer": "llm", "cache": True},
+        "display": {"level": "minimal"},
+        "session": {"dir": "~/.tasker/sessions", "workspace_dir": "~/.tasker/workspace"},
         "workspace_dir": "workspaces",
         "report_dir": "reports",
         "max_parallel": 2,

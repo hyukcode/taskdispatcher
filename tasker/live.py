@@ -22,7 +22,7 @@ import threading
 from . import console
 from .models import Event, TaskRun
 
-CMDS = ("help", "status", "plan", "allow", "deny", "pause", "resume", "done", "quit", "q", "exit", "attach")
+CMDS = ("help", "status", "plan", "allow", "deny", "approve", "reject", "pause", "resume", "done", "quit", "q", "exit", "attach")
 
 HELP = """\
 输入指令（agent 运行期间随时可用）：
@@ -32,15 +32,20 @@ HELP = """\
   @codex <消息>        只发给 codex 执行的任务
   @<任务id> <消息>     发给指定任务（如 @t2 ...）
   <普通文本>            等同 @all <文本>，用于继续提要求
-  :allow [<id>]        批准最近/指定审批请求
-  :deny  [<id>]        拒绝最近/指定审批请求
-  :done  [<taskid>]    手动收尾指定/最近任务
+  :allow [<id>]        批准最近/指定工具审批请求
+  :deny  [<id>]        拒绝最近/指定工具审批请求
+  :approve [<id>]      人工审查点：通过
+  :reject <反馈>       人工审查点：驳回（反馈注回上游重跑）
   :status              打印各任务进度
   :plan                重新打印计划
   :pause / :resume     暂停输入转发 / 恢复
-  :attach <claude|codex>  把终端接管给该 agent 的交互 TUI（macOS 生效）
-  :quit                终止所有运行中的 agent 并退出
+  :quit / quit / exit  终止所有运行中的 agent 并退出程序（或 Ctrl+C）
 """
+
+# minimal 显示只放行这些事件（其余 thinking/tool_use/tool_result/text/system 不打印）
+_MINIMAL_KINDS = frozenset(
+    {"result", "permission_request", "permission_result", "review_request", "review_result", "error", "user_message"}
+)
 
 APPROVAL_BANNER = """\
 ╔══════════════════════════════════════════════════════════╗
@@ -61,6 +66,9 @@ def parse_input_line(raw: str) -> dict:
         cmd = (parts[0] or "").lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
         return {"type": "cmd", "cmd": cmd, "arg": arg}
+    # 退出词兼容：裸 quit/exit/q 或 /quit /exit /q 在运行中也当作退出指令（不再误发成消息）
+    if s.lower() in ("quit", "q", "exit", "/quit", "/q", "/exit"):
+        return {"type": "cmd", "cmd": "quit", "arg": ""}
     if s.startswith("@"):
         m = re.match(r"@(\S+)(?:\s+(.*))?$", s)
         target = (m.group(1) or "all").lower() if m else "all"
@@ -175,9 +183,10 @@ def _raw_stop() -> None:
 class LiveTui:
     """精简实时输出 + 输入行锚定底部 + 审批抑制。"""
 
-    def __init__(self, think_level: str = "full", input_enabled: bool = True):
+    def __init__(self, think_level: str = "full", input_enabled: bool = True, display_level: str = "verbose"):
         self.think_level = think_level
         self.input_enabled = input_enabled
+        self.display_level = display_level
         self._cmds: "queue.Queue[dict]" = queue.Queue()
         self._stop = threading.Event()
         self._print_lock = threading.RLock()
@@ -318,8 +327,12 @@ class LiveTui:
 
         # 审批期间：只放行审批相关事件和错误
         if self._hold.is_set() and kind not in (
-            "permission_request", "permission_result", "error", "result", "user_message"
+            "permission_request", "permission_result", "review_request", "review_result", "error", "result", "user_message"
         ):
+            return
+
+        # minimal 显示：只放行关键事件（result / 审批 / 审查 / 错误），其余不打印
+        if self.display_level == "minimal" and kind not in _MINIMAL_KINDS:
             return
 
         with self._print_lock:
@@ -335,6 +348,10 @@ class LiveTui:
                 self._emit_permission_request_locked(tag, event)
             elif kind == "permission_result":
                 self._emit_permission_result_locked(tag, event)
+            elif kind == "review_request":
+                self._emit_review_request_locked(tag, event)
+            elif kind == "review_result":
+                self._emit_review_result_locked(tag, event)
             elif kind == "text":
                 self._emit_text_locked(tag, event)
             elif kind == "user_message":
@@ -385,6 +402,8 @@ class LiveTui:
             self._write_locked(console.paint(f"         …（共 {len(lines)} 行，完整内容见 raw 日志）", "dim"))
 
     def _emit_permission_request_locked(self, tag: str, event: Event) -> None:
+        if event.data.get("auto"):
+            return  # 自动通过的审批不展示
         tool = event.data.get("tool", "?")
         inp = event.data.get("input", {})
         req_id = event.data.get("id", "")[:16]
@@ -392,6 +411,8 @@ class LiveTui:
         self._write_locked(f"         id={req_id}  {_fmt_tool_input_compact(inp)}")
 
     def _emit_permission_result_locked(self, tag: str, event: Event) -> None:
+        if event.data.get("auto"):
+            return  # 自动通过的审批不展示
         allowed = event.data.get("allowed")
         if allowed is True:
             self._write_locked(console.paint(f"[{tag}] ✅ 已批准", "green"))
@@ -399,6 +420,23 @@ class LiveTui:
             self._write_locked(console.paint(f"[{tag}] ⛔ 已拒绝", "red"))
         else:
             self._write_locked(f"[{tag}] ❔ {event.text[:120]}")
+
+    def _emit_review_request_locked(self, tag: str, event: Event) -> None:
+        node = event.data.get("node", "")
+        title = event.data.get("title", "人工审查")
+        self._write_locked(console.paint(f"[{tag}] 👁️ 人工审查点 {node} — {title}", "bold", "yellow"))
+        self._write_locked("         输入 :approve 通过 | :reject <反馈> 驳回重跑")
+        if event.text:
+            self._write_locked(f"         {_truncate(event.text, 200)}")
+
+    def _emit_review_result_locked(self, tag: str, event: Event) -> None:
+        approved = event.data.get("approved")
+        if approved is True:
+            self._write_locked(console.paint(f"[{tag}] ✅ 审查通过", "green"))
+        elif approved is False:
+            self._write_locked(console.paint(f"[{tag}] ↩️ 审查驳回：{_truncate(event.text, 160)}", "yellow"))
+        else:
+            self._write_locked(f"[{tag}] ❔ 审查结果 {_truncate(event.text, 160)}")
 
     # ---------- 控制 ----------
     def pause(self) -> None:

@@ -29,10 +29,13 @@ except ImportError:  # pragma: no cover
 
 
 def _make_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tasker", description="把 prompt 拆给 claude code 与 codex 执行，实时输出两者思维链/工具调用/交互/审批")
+    p = argparse.ArgumentParser(prog="tasker", description="交互式目标驱动多智能体编排器：输入目标 → 拆分 → claude code / codex 执行 → 直到 goal 达成")
     p.add_argument("--version", action="version", version=f"tasker {__version__}")
     p.add_argument("--config", default=None, help="配置文件路径（默认 ./config.json）")
-    sub = p.add_subparsers(dest="command", required=True)
+    sub = p.add_subparsers(dest="command", required=False)
+
+    rp = sub.add_parser("repl", help="进入交互式 REPL（无参数默认）")
+    rp.add_argument("--mock", action="store_true", help="用模拟 runner 演示全流程（无需 claude/codex/API key）")
 
     r = sub.add_parser("run", help="交互式运行")
     r.add_argument("prompt", nargs="?", default="")
@@ -73,6 +76,19 @@ def _read_prompt(arg: str) -> str:
     if not sys.stdin.isatty():
         return sys.stdin.read().strip()
     return input("请输入任务目标: ").strip()
+
+
+def cmd_repl(args, cfg) -> int:
+    """进入交互式 REPL（无参数默认入口）。"""
+    if getattr(args, "mock", False) or cfg.mock:
+        cfg.mock = True
+        _inject_mock_executor(cfg)
+    else:
+        _inject_sdk_executor()
+        _inject_codex_app_server(cfg)
+    from .repl import main_loop
+
+    return main_loop(cfg)
 
 
 def cmd_run(args, cfg) -> int:
@@ -256,15 +272,18 @@ def _auto_match_template(prompt: str) -> dict | None:
 
 
 def _inject_mock_executor(cfg) -> None:
+    import tasker.graph_executor as gx
     import tasker.scheduler as sched_mod
 
     if MockRunner is None:
         return
+    gx.EXECUTOR_TO_RUNNER.update({"claude": MockRunner, "codex": MockRunner})
     sched_mod.EXECUTOR_TO_RUNNER = {"claude": MockRunner, "codex": MockRunner}
 
 
 def _inject_sdk_executor() -> bool:
     """将 claude executor 切换为 SDK 后端。返回 True 表示切换成功。"""
+    import tasker.graph_executor as gx
     import tasker.scheduler as sched_mod
 
     try:
@@ -275,6 +294,7 @@ def _inject_sdk_executor() -> bool:
 
     from .sdk_runner import SdkClaudeRunner
 
+    gx.EXECUTOR_TO_RUNNER["claude"] = SdkClaudeRunner
     sched_mod.EXECUTOR_TO_RUNNER["claude"] = SdkClaudeRunner
     return True
 
@@ -286,6 +306,7 @@ def _inject_codex_app_server(cfg) -> bool:
 
     import subprocess
 
+    import tasker.graph_executor as gx
     import tasker.scheduler as sched_mod
 
     from .spawn import resolve_binary
@@ -306,6 +327,7 @@ def _inject_codex_app_server(cfg) -> bool:
 
     from .codex_app_server_runner import CodexAppServerRunner
 
+    gx.EXECUTOR_TO_RUNNER["codex"] = CodexAppServerRunner
     sched_mod.EXECUTOR_TO_RUNNER["codex"] = CodexAppServerRunner
     return True
 
@@ -403,6 +425,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cfg = load_config(args.config)
     try:
+        if args.command is None or args.command == "repl":
+            return cmd_repl(args, cfg)
         if args.command == "run":
             return cmd_run(args, cfg)
         if args.command == "plan":

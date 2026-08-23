@@ -18,6 +18,7 @@ import threading
 import time
 
 from . import __version__
+from .approvals import ApprovalBroker
 from .config import Config
 from .models import Event, TaskRun
 from .spawn import ProcChannel, resolve_binary, start_process
@@ -53,12 +54,13 @@ class CodexAppServerRunner:
     source = "codex"
     self_handles_approval = True
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str):
+    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
         self.cfg = cfg
         self.run = run
         self.workdir = workdir
         self.on_event = on_event
         self.prompt = prompt
+        self.broker = broker or ApprovalBroker(cfg.approval)
         self.channel: ProcChannel | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -75,7 +77,6 @@ class CodexAppServerRunner:
         self._injection_ts: float | None = None
         self._last_event_ts = time.time()
         self._settle = float(getattr(cfg.codex, "completion_idle", 5.0))
-        self._pending_approvals: dict[str, tuple] = {}  # rpc_id → (msg, threading.Event, holder)
         self._steer_queue: list[str] = []
         self._steer_lock = threading.Lock()
 
@@ -150,19 +151,10 @@ class CodexAppServerRunner:
     # ---------- 审批接口（duck-typed，供 scheduler 的 :allow/:deny 路由）----------
     @property
     def pending_approval_ids(self) -> list[str]:
-        return list(self._pending_approvals.keys())
+        return self.broker.pending_ids
 
     def approval_respond(self, req_id: str, allowed: bool) -> bool:
-        item = self._pending_approvals.get(req_id)
-        if item is None:
-            return False
-        _msg, ev, holder = item
-        holder["allowed"] = allowed
-        try:
-            ev.set()
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        return self.broker.resolve(req_id, allowed=allowed)
 
     # ================================================================
     #  事件泵
@@ -426,14 +418,11 @@ class CodexAppServerRunner:
             pass  # 审批已解决，确认信号
         elif method == "error":
             err = params.get("error", params)
-            self._emit(
-                Event(
-                    kind="error",
-                    source=self.source,
-                    text=str(err.get("message", "") or _compact(err, 200)),
-                    data=params,
-                )
-            )
+            message = str(err.get("message", "") or _compact(err, 200))
+            # codex 断线自动重连是临时状态（"Reconnecting... n/5"），非任务失败；
+            # 降级为 system（minimal 模式下不刷屏），避免被误读为致命错误。
+            kind = "system" if message.startswith("Reconnecting") else "error"
+            self._emit(Event(kind=kind, source=self.source, text=message, data=params))
         elif method == "warning" or method == "configWarning":
             self._emit(
                 Event(
@@ -654,26 +643,22 @@ class CodexAppServerRunner:
             text = str(display)[:200]
             data = {"id": rid, "tool": method.split("/")[1], "input": params, "request_data": params}
 
-        req = Event(kind="permission_request", source=self.source, text=text, data=data)
+        mode = self.cfg.approval.mode
+        req = Event(kind="permission_request", source=self.source, text=text, data={**data, "auto": mode == "auto"})
         self._emit(req)
 
-        mode = self.cfg.approval.mode
         if mode == "auto":
-            self._decide_approval(msg, bool(self.cfg.approval.default_allow), "auto 模式")
+            self._decide_approval(msg, bool(self.cfg.approval.default_allow), "auto 模式", auto=True)
         elif mode == "log":
             self._decide_approval(msg, False, "log 模式：仅记录，默认拒绝")
         else:  # ask_console —— 阻塞 pump 等待 :allow/:deny
-            ev = threading.Event()
-            holder: dict = {"allowed": None}
-            self._pending_approvals[rid] = (msg, ev, holder)
-            got = ev.wait(timeout=self.cfg.approval.timeout)
-            self._pending_approvals.pop(rid, None)
-            if got and holder["allowed"] is not None:
-                self._decide_approval(msg, holder["allowed"])
+            got, allowed, _feedback = self.broker.wait_decision(rid, kind="permission", run=self.run, event=req)
+            if got and allowed is not None:
+                self._decide_approval(msg, allowed)
             else:
                 self._decide_approval(msg, False, "审批超时，默认拒绝")
 
-    def _decide_approval(self, msg: dict, allowed: bool, note: str = "") -> None:
+    def _decide_approval(self, msg: dict, allowed: bool, note: str = "", auto: bool = False) -> None:
         rid = msg.get("id")
         method = msg.get("method", "")
         params = msg.get("params") or {}
@@ -706,7 +691,7 @@ class CodexAppServerRunner:
                 kind="permission_result",
                 source=self.source,
                 text=f"{'批准' if allowed else '拒绝'} {note} 请求 {rid}".strip(),
-                data={"allowed": allowed, "id": str(rid)},
+                data={"allowed": allowed, "id": str(rid), "auto": auto},
             )
         )
 

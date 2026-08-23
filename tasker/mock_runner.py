@@ -12,12 +12,13 @@ from .models import Event, TaskRun
 class MockRunner:
     source = "mock"
 
-    def __init__(self, cfg, run: TaskRun, workdir: str, on_event, prompt: str):
+    def __init__(self, cfg, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
         self.cfg = cfg
         self.run = run
         self.workdir = workdir
         self.on_event = on_event
         self.prompt = prompt
+        self.broker = broker  # 非自管理审批（mock 由 ApprovalPolicy 处理），保留统一构造签名
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._interactions: list[str] = []
@@ -78,13 +79,13 @@ class MockRunner:
             )
             self._emit(Event(kind="thinking", source=self.source, text=f"[{exe}] 已读取上下文，接下来执行核心动作。"))
 
-            # 模拟一次审批请求（演示审批事件流；由 ApprovalPolicy auto 模式自动批准并回注消息）
+            # 模拟一次审批请求（演示审批事件流；auto 模式带标记、live 层不展示）
             self._emit(
                 Event(
                     kind="permission_request",
                     source=self.source,
                     text="Write",
-                    data={"id": f"mock_approve_{tid}", "tool": "Write", "input": {"path": "out.txt", "content": "…"}},
+                    data={"id": f"mock_approve_{tid}", "tool": "Write", "input": {"path": "out.txt", "content": "…"}, "auto": self.cfg.approval.mode == "auto"},
                 )
             )
             time.sleep(delay)

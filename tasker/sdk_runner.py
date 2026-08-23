@@ -18,6 +18,7 @@ import threading
 import time
 from concurrent import futures
 
+from .approvals import ApprovalBroker
 from .config import Config
 from .models import Event, TaskRun
 
@@ -36,12 +37,13 @@ class SdkClaudeRunner:
     # 审批请求由本 runner 的 can_use_tool 自行处理，调度器的 ApprovalPolicy 不要再插手
     self_handles_approval = True
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str):
+    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
         self.cfg = cfg
         self.run = run
         self.workdir = workdir
         self.on_event = on_event
         self.prompt = prompt
+        self.broker = broker or ApprovalBroker(cfg.approval)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client = None
         self._stop = threading.Event()
@@ -52,8 +54,6 @@ class SdkClaudeRunner:
         self._injection_ts: float | None = None
         self._last_event_ts: float = time.time()
         self._settle = float(getattr(cfg.claude, "completion_idle", 5.0))
-        # tool_use_id -> (loop, future, permission_request_event)；ask_console 模式等待 :allow/:deny
-        self._approval_futures: dict[str, tuple] = {}
 
     # ---------- 生命周期 ----------
     def start(self) -> None:
@@ -168,14 +168,14 @@ class SdkClaudeRunner:
     # ---------- can_use_tool：headless 程序化审批 ----------
     async def _can_use_tool(self, tool_name: str, input_data: dict, context) -> sdk.PermissionResult:
         tool_use_id = (context.tool_use_id if context is not None else None) or str(time.time())
+        mode = self.cfg.approval.mode
         req = Event(
             kind="permission_request",
             source=self.source,
             text=f"{tool_name} {_compact(input_data, 120)}",
-            data={"tool": tool_name, "input": input_data, "id": tool_use_id, "tool_use_id": tool_use_id},
+            data={"tool": tool_name, "input": input_data, "id": tool_use_id, "tool_use_id": tool_use_id, "auto": mode == "auto"},
         )
         self._emit(req)
-        mode = self.cfg.approval.mode
 
         if mode == "auto":
             allowed = self.cfg.approval.default_allow
@@ -188,13 +188,18 @@ class SdkClaudeRunner:
         # ask_console：在 CLI 展示审批请求，阻塞等待用户 :allow/:deny
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
-        self._approval_futures[tool_use_id] = (loop, fut, req)
+
+        def _resolve(allowed: bool, feedback: str) -> None:
+            if not fut.done():
+                loop.call_soon_threadsafe(fut.set_result, allowed)
+
+        self.broker.register_async(tool_use_id, kind="permission", run=self.run, event=req, resolver=_resolve)
         try:
-            allowed = await asyncio.wait_for(asyncio.to_thread(fut.result, 120.0), 120.0)
+            allowed = await asyncio.wait_for(fut, self.cfg.approval.timeout)
         except (asyncio.TimeoutError, futures.TimeoutError):
             allowed = False
         finally:
-            self._approval_futures.pop(tool_use_id, None)
+            self.broker.unregister(tool_use_id)
         self._permission_result(req, allowed)
         return sdk.PermissionResultAllow() if allowed else sdk.PermissionResultDeny(message="用户拒绝")
 
@@ -205,30 +210,17 @@ class SdkClaudeRunner:
                 kind="permission_result",
                 source=self.source,
                 text=f"{head} {note or req.text}",
-                data={"allowed": allowed, "id": req.data.get("id")},
+                data={"allowed": allowed, "id": req.data.get("id"), "auto": bool(req.data.get("auto"))},
             )
         )
 
     @property
     def pending_approval_ids(self) -> list[str]:
-        return list(self._approval_futures.keys())
+        return self.broker.pending_ids
 
     def approval_respond(self, req_id: str, allowed: bool) -> bool:
         """调度器 :allow/:deny 送达：解析阻塞在 can_use_tool 里的等待。"""
-        item = self._approval_futures.get(req_id)
-        if item is None:
-            return False
-        loop, fut, _req = item
-
-        def _resolve() -> None:
-            if not fut.done():
-                fut.set_result(allowed)
-
-        try:
-            loop.call_soon_threadsafe(_resolve)
-            return True
-        except Exception:  # noqa: BLE001
-            return False
+        return self.broker.resolve(req_id, allowed=allowed)
 
     # ---------- 事件泵 ----------
     def _emit(self, event: Event) -> None:

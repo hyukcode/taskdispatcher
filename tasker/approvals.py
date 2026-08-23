@@ -1,15 +1,21 @@
-"""审批请求处理策略。
+"""审批请求处理：统一 Broker + 非自管理策略。
 
-headless 模式下各 CLI 对审批的表现不同：
-- claude -p：权限弹窗只在交互 TTY 出现；headless 下工具按 permission_mode 自动允许/拒绝，
-  我们把拒绝事件（tool_result / result.permission_denials）采集上报，必要时回注一条用户消息
-  告知模型"用户已批准，请继续"。
-- codex exec --json：会在 stdout 发 approval_request 事件，但非交互下无法经 stdin 回答；
-  auto_approve 由 --auto-approve 开关控制。
-真正的"人点批准/拒绝"交互请用 ptty attach 模式（macOS 原生支持）。
+两类「阻塞 flow 线程 + REPL 决定」的交互共用 ApprovalBroker：
+1. 工具审批（permission_request）：claude/codex 运行时工具需权限。
+2. 人工审查（review_request）：图执行到 executor=="human" 节点。
+
+ApprovalBroker 只负责「待决策注册表 + 解除阻塞」，具体阻塞原语由调用方持有：
+- 同步 runner（codex exec / codex app-server）用 wait_decision（threading.Event）。
+- 异步 runner（SdkClaudeRunner）用 register_async + resolve（asyncio.Future）。
+
+ApprovalPolicy 保留，用于「非自管理审批」的 runner（mock / claude stream-json）：
+headless 下 claude -p 不产生 permission_request，权限按 permission_mode 自动放行/拒绝，
+拒绝体现为 tool_result 与 result.permission_denials，一并采集。
 """
+
 from __future__ import annotations
 
+import threading
 import time
 
 from .config import ApprovalConfig
@@ -18,7 +24,72 @@ from .models import Event, TaskRun
 MODES = ("auto", "log", "ask_console")
 
 
+class ApprovalBroker:
+    """统一待决策注册表：审批 + 人工审查，REPL 通过 resolve() 解除阻塞。"""
+
+    def __init__(self, cfg: ApprovalConfig):
+        self.cfg = cfg
+        self._pending: dict[str, dict] = {}
+        self._lock = threading.Lock()
+
+    # ---------- 同步阻塞（threading.Event） ----------
+    def wait_decision(self, req_id: str, *, kind: str, run: TaskRun | None = None, event: Event | None = None, timeout: float | None = None) -> tuple[bool, bool | None, str]:
+        """阻塞当前线程等待决策，返回 (got, allowed, feedback)。"""
+        timeout = self.cfg.timeout if timeout is None else timeout
+        ev = threading.Event()
+        holder: dict = {"allowed": None, "feedback": ""}
+        with self._lock:
+            self._pending[req_id] = {"kind": kind, "run": run, "event": event, "_ev": ev, "_holder": holder}
+        got = ev.wait(timeout=timeout)
+        with self._lock:
+            self._pending.pop(req_id, None)
+        return got, holder["allowed"], holder["feedback"]
+
+    # ---------- 异步阻塞（asyncio.Future，由调用方 resolve） ----------
+    def register_async(self, req_id: str, *, kind: str, run: TaskRun | None = None, event: Event | None = None, resolver) -> None:
+        with self._lock:
+            self._pending[req_id] = {"kind": kind, "run": run, "event": event, "_resolver": resolver}
+
+    def unregister(self, req_id: str) -> None:
+        with self._lock:
+            self._pending.pop(req_id, None)
+
+    # ---------- 统一解除 ----------
+    def resolve(self, req_id: str, *, allowed: bool, feedback: str = "") -> bool:
+        with self._lock:
+            item = self._pending.pop(req_id, None)
+        if item is None:
+            return False
+        if "_resolver" in item:
+            item["_resolver"](allowed, feedback)
+            return True
+        item["_holder"]["allowed"] = allowed
+        item["_holder"]["feedback"] = feedback
+        item["_ev"].set()
+        return True
+
+    # ---------- 查询 ----------
+    def find_pending_id(self, kind: str | None = None) -> str:
+        with self._lock:
+            items = list(self._pending.items())
+        for rid, it in reversed(items):
+            if kind is None or it["kind"] == kind:
+                return rid
+        return ""
+
+    @property
+    def pending_ids(self) -> list[str]:
+        with self._lock:
+            return list(self._pending.keys())
+
+    def has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._pending)
+
+
 class ApprovalPolicy:
+    """非自管理审批的决策策略（mock / claude stream-json 回退路径）。"""
+
     def __init__(self, cfg: ApprovalConfig, on_decision=None):
         self.cfg = cfg
         self.on_decision = on_decision

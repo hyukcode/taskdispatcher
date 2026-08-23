@@ -21,12 +21,13 @@ from .spawn import ProcChannel, resolve_binary, start_process
 class ClaudeRunner:
     source = "claude"
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str):
+    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
         self.cfg = cfg
         self.run = run
         self.workdir = workdir
         self.on_event = on_event
         self.prompt = prompt
+        self.broker = broker  # 非自管理审批（headless stream-json 无 permission_request），保留统一构造签名
         self.channel: ProcChannel | None = None
         self._tool_names: dict[str, str] = {}
         self._stop = threading.Event()
