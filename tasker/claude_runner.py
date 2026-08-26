@@ -1,11 +1,4 @@
-"""Claude Code 采集器。
 
-headless 方式：claude -p --output-format stream-json --verbose --input-format stream-json
-- 从 stdout 逐行解析事件：thinking（思维链）、tool_use、tool_result、task 事件、result。
-- stdin 保持打开：send_message() 以 stream-json 用户消息实时注入，实现"中途修改/继续要求"。
-- 权限相关：headless 下权限弹窗不触发（交互 TTY 才有），工具执行/拒绝会体现为
-  tool_result 与 result.permission_denials，一并采集。
-"""
 from __future__ import annotations
 
 import json

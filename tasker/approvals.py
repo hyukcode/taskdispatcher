@@ -1,17 +1,3 @@
-"""审批请求处理：统一 Broker + 非自管理策略。
-
-两类「阻塞 flow 线程 + REPL 决定」的交互共用 ApprovalBroker：
-1. 工具审批（permission_request）：claude/codex 运行时工具需权限。
-2. 人工审查（review_request）：图执行到 executor=="human" 节点。
-
-ApprovalBroker 只负责「待决策注册表 + 解除阻塞」，具体阻塞原语由调用方持有：
-- 同步 runner（codex exec / codex app-server）用 wait_decision（threading.Event）。
-- 异步 runner（SdkClaudeRunner）用 register_async + resolve（asyncio.Future）。
-
-ApprovalPolicy 保留，用于「非自管理审批」的 runner（mock / claude stream-json）：
-headless 下 claude -p 不产生 permission_request，权限按 permission_mode 自动放行/拒绝，
-拒绝体现为 tool_result 与 result.permission_denials，一并采集。
-"""
 
 from __future__ import annotations
 

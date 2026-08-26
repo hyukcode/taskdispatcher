@@ -1,12 +1,4 @@
-"""CLI 入口。
 
-用法：
-  tasker run <prompt>                交互式运行（实时输出思维链/工具/交互/审批，可中途注入消息）
-  tasker plan <prompt>                只打印拆分计划
-  tasker attach claude|codex [prompt] 把终端交给交互 TUI（macOS 看真实审批）
-  tasker verify-config                检查 CLI / API key
-  tasker init                         生成 config.json
-"""
 from __future__ import annotations
 
 import argparse
@@ -19,12 +11,13 @@ from . import console
 from .config import load_config, save_example_config
 from .live import LiveTui
 from .llm import LLMError
+from .models import subtask_to_dict
 from .planner import plan_with_llm, plan_with_rules
 from .scheduler import Scheduler
 
 try:
     from .mock_runner import MockRunner
-except ImportError:  # pragma: no cover
+except ImportError:
     MockRunner = None
 
 
@@ -36,6 +29,7 @@ def _make_parser() -> argparse.ArgumentParser:
 
     rp = sub.add_parser("repl", help="进入交互式 REPL（无参数默认）")
     rp.add_argument("--mock", action="store_true", help="用模拟 runner 演示全流程（无需 claude/codex/API key）")
+    rp.add_argument("--template", default=None, help="REPL 使用的任务拆解模板名称或 JSON 文件路径")
 
     r = sub.add_parser("run", help="交互式运行")
     r.add_argument("prompt", nargs="?", default="")
@@ -88,7 +82,8 @@ def cmd_repl(args, cfg) -> int:
         _inject_codex_app_server(cfg)
     from .repl import main_loop
 
-    return main_loop(cfg)
+    template = _load_template(args.template) if getattr(args, "template", None) else None
+    return main_loop(cfg, template=template)
 
 
 def cmd_run(args, cfg) -> int:
@@ -104,9 +99,12 @@ def cmd_run(args, cfg) -> int:
         overrides["timeout_per_task"] = args.timeout
     cfg = load_config(args.config, overrides=overrides)
 
-    tui = LiveTui(think_level=args.think, input_enabled=not args.no_input)
+    tui = LiveTui(
+        think_level=args.think,
+        display_level=cfg.display.level,
+        input_enabled=not args.no_input,
+    )
 
-    # 计划：mock 或 plan-rules 用规则；否则调 LLM（失败时回退到规则拆分）
     template = _load_template(args.template) if args.template else _auto_match_template(prompt)
     if args.mock:
         cfg.mock = True
@@ -147,23 +145,19 @@ def cmd_run(args, cfg) -> int:
 
 
 def _load_template(name: str) -> dict | None:
-    """从模板名称加载任务拆解模板（通过 tasker-template 包）。
 
-    兼容旧用法：如果 name 看起来像文件路径（含路径分隔符或 .json 后缀），
-    回退到从文件加载。
-    """
     import os
 
-    # 如果像文件路径，回退到文件加载（兼容旧用法）
     if os.sep in name or "/" in name or name.endswith(".json"):
         return _load_template_from_file(name)
 
-    # 按名称从模板库查找
     try:
         from template import get_template
 
         tpl = get_template(name)
         if tpl:
+            tpl = dict(tpl)
+            tpl.pop("_meta", None)
             return tpl
         console.warn(f"模板库中未找到模板: {name}")
         return None
@@ -176,13 +170,7 @@ def _load_template(name: str) -> dict | None:
 
 
 def _load_template_from_file(path: str) -> dict | None:
-    """从文件路径加载任务拆解模板（兼容旧用法）。
 
-    支持三种格式：
-    1. tasker-template 生成的 JSON 模板（以 template_name / suggested_tasks 为 key）
-    2. planner 兼容的 JSON（以 objective / tasks 为 key）
-    3. 原始项目文件（自动通过 template 包的 extract_template 处理）
-    """
     import os as _os
     from pathlib import Path
 
@@ -191,7 +179,34 @@ def _load_template_from_file(path: str) -> dict | None:
         console.warn(f"模板文件不存在: {p}")
         return None
 
-    # 尝试用 tasker-template 包的 extract_template 处理
+    if p.suffix.lower() == ".json":
+        try:
+            import json
+
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if "template_name" in data and "suggested_tasks" in data:
+                data.pop("_meta", None)
+                return data
+            if "objective" in data and "tasks" in data:
+                items = [
+                    {
+                        "title": t.get("title", ""),
+                        "description": t.get("description", ""),
+                        "acceptance": t.get("acceptance", ""),
+                        "tool": t.get("tool") or t.get("skill", ""),
+                        "internal_loop": t.get("internal_loop", t.get("loop")),
+                    }
+                    for t in data.get("tasks", [])
+                ]
+                return {
+                    "template_name": data.get("objective", ""),
+                    "source_file": str(p),
+                    "system_prompt_extension": data.get("rationale", ""),
+                    "suggested_tasks": items,
+                }
+        except (OSError, json.JSONDecodeError, TypeError):
+            pass
+
     try:
         from template import extract_template as _extract
 
@@ -202,20 +217,19 @@ def _load_template_from_file(path: str) -> dict | None:
     except Exception as e:
         console.warn(f"模板提取失败（{e}），回退到原始 JSON 解析")
 
-    # 回退：直接读取 JSON
     try:
         import json
 
         data = json.loads(p.read_text(encoding="utf-8"))
         if "template_name" in data:
-            return data  # tasker-template 格式
+            return data
         if "objective" in data and "tasks" in data:
-            # planner JSON 格式 → 转换为 template 格式
             items = [
                 {
                     "title": t.get("title", ""),
                     "description": t.get("description", ""),
                     "acceptance": t.get("acceptance", ""),
+                    "tool": t.get("tool") or t.get("skill", ""),
                 }
                 for t in data.get("tasks", [])
             ]
@@ -233,31 +247,21 @@ def _load_template_from_file(path: str) -> dict | None:
 
 
 def _auto_match_template(prompt: str) -> dict | None:
-    """根据 prompt 关键词自动匹配本地模板库中的模板。
 
-    匹配逻辑：将 prompt 拆成词（中英文），在模板名称和 tags 中查找。
-    返回第一个匹配到的模板，未匹配到返回 None。
-    """
     try:
         from template import search_templates, get_template
     except ImportError:
         return None
 
-    # 提取关键词：中文字符 + 英文单词
     import re
 
     keywords = set()
-    # 中文：连续的 CJK 字符
-    for m in re.finditer(r"[一-鿿㐀-䶿]+", prompt):
-        keywords.add(m.group())
-    # 英文：取 3 字母以上的单词
     for m in re.finditer(r"[a-zA-Z]{3,}", prompt):
         keywords.add(m.group().lower())
 
     if not keywords:
         return None
 
-    # 用 search_templates 依次搜索每个关键词
     seen: set[str] = set()
     for kw in keywords:
         results = search_templates(keyword=kw)
@@ -282,12 +286,11 @@ def _inject_mock_executor(cfg) -> None:
 
 
 def _inject_sdk_executor() -> bool:
-    """将 claude executor 切换为 SDK 后端。返回 True 表示切换成功。"""
     import tasker.graph_executor as gx
     import tasker.scheduler as sched_mod
 
     try:
-        import claude_agent_sdk  # noqa: F401 — 检测 SDK 是否已安装
+        import claude_agent_sdk
     except ImportError:
         console.warn("claude-agent-sdk 未安装，claude 任务将使用 stream-json 后端（pip install claude-agent-sdk 可启用 headless 审批）")
         return False
@@ -300,7 +303,6 @@ def _inject_sdk_executor() -> bool:
 
 
 def _inject_codex_app_server(cfg) -> bool:
-    """把 codex executor 切换为 app-server JSON-RPC 后端。返回 True 表示切换成功。"""
     if not cfg.codex.use_app_server:
         return False
 
@@ -318,7 +320,7 @@ def _inject_codex_app_server(cfg) -> bool:
             timeout=10,
         )
         ok = r.returncode == 0
-    except Exception:  # noqa: BLE001
+    except Exception:
         ok = False
 
     if not ok:
@@ -349,7 +351,7 @@ def cmd_plan(args, cfg) -> int:
                 {
                     "objective": plan.objective,
                     "rationale": plan.rationale,
-                    "tasks": [t.__dict__ for t in plan.tasks],
+                    "tasks": [subtask_to_dict(t) for t in plan.tasks],
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -408,7 +410,6 @@ def cmd_init(args, cfg) -> int:
     if args.config:
         path = args.config
     else:
-        # 默认写入用户级配置 ~/.tasker/config.json，避免配置跟随当前目录
         p = _user_config_path()
         p.parent.mkdir(parents=True, exist_ok=True)
         path = str(p)

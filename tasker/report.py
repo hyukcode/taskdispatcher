@@ -1,4 +1,3 @@
-"""可选：把一次运行的完整轨迹落成 Markdown 报告（辅助，非默认输出）。"""
 from __future__ import annotations
 
 import time

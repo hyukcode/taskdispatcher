@@ -1,15 +1,4 @@
-"""图执行器：CompiledGraph → 分派 runner 执行，覆盖 DAG / loop / human 三种结构。
 
-取代 Scheduler 的核心职责：
-- DAG：按边做拓扑分层，层内并行、层间串行。
-- loop：entry → … → 回边起点 反复迭代；每轮用 judge 判定 exit_condition，
-  满足则结束，不满足则把反馈注回 loop 起点重跑。
-- human：executor=="human" 节点阻塞等待用户决定（走 ApprovalBroker 的 review 类），
-  :approve 继续；:reject <反馈> 把反馈注回上游节点重跑后再审查。
-
-runner 注册表 EXECUTOR_TO_RUNNER 可被 main 注入 SDK / app-server / mock 后端。
-loop 的 exit_condition 判定由 judge（默认 LLM）完成；judge 可被外部注入以便测试。
-"""
 from __future__ import annotations
 
 import json
@@ -44,7 +33,6 @@ JUDGE_PROMPT = """\
 
 
 def llm_judge_condition(cfg: Config, condition: str, context: str) -> dict:
-    """默认 loop 退出条件判定：调 LLM 返回 {satisfied, feedback}。失败按未满足处理。"""
     try:
         raw = chat(
             cfg.llm,
@@ -62,7 +50,6 @@ def llm_judge_condition(cfg: Config, condition: str, context: str) -> dict:
 
 
 def _topo_layers(nodes: list[SubTask], edges) -> list[list[SubTask]]:
-    """按边做拓扑分层（容错：遇环强制推进，不会死循环）。"""
     ids = {n.id for n in nodes}
     by_id = {n.id: n for n in nodes}
     indeg = {n.id: 0 for n in nodes}
@@ -75,7 +62,7 @@ def _topo_layers(nodes: list[SubTask], edges) -> list[list[SubTask]]:
     layers: list[list[SubTask]] = []
     while remaining:
         ready = sorted(nid for nid, d in remaining.items() if d == 0)
-        if not ready:  # 环：强制选最小 id 推进
+        if not ready:
             ready = [sorted(remaining)[0]]
         layers.append([by_id[nid] for nid in ready])
         for nid in ready:
@@ -86,7 +73,6 @@ def _topo_layers(nodes: list[SubTask], edges) -> list[list[SubTask]]:
 
 
 class GraphExecutor:
-    """执行 CompiledGraph。emit(run, event) 用于把事件透出给 REPL/会话层。"""
 
     def __init__(
         self,
@@ -116,7 +102,6 @@ class GraphExecutor:
         self._active: dict[str, tuple] = {}
         self._active_lock = threading.Lock()
 
-    # ---------- 事件 ----------
     @staticmethod
     def _default_emit(run: TaskRun | None, event: Event) -> None:
         console.event_line(event.summary(), source=event.source)
@@ -124,15 +109,11 @@ class GraphExecutor:
     def _emit(self, run: TaskRun | None, event: Event) -> None:
         self.emit(run, event)
 
-    # ---------- 主入口 ----------
     def execute(self) -> list[TaskRun]:
         if not self.graph.nodes:
             return []
         try:
-            if self.graph.loop:
-                self._execute_with_loop()
-            else:
-                self._execute_dag()
+            self._execute_dag()
         finally:
             self._quit.set()
         return list(self.runs.values())
@@ -145,7 +126,6 @@ class GraphExecutor:
             runner.stop()
 
     def send_message(self, target: str, text: str) -> list[str]:
-        """REPL 注入：把消息路由给匹配的活跃 runner（@all/@claude/@codex/@<id>）。"""
         if not text:
             return []
         matched: list[str] = []
@@ -164,9 +144,6 @@ class GraphExecutor:
     def pending_approval_ids(self) -> list[str]:
         return self.broker.pending_ids
 
-    # ================================================================
-    #  DAG 执行（含 human 审查节点）
-    # ================================================================
     def _execute_dag(self) -> None:
         layers = _topo_layers(self.graph.nodes, self.graph.edges)
         for layer in layers:
@@ -175,8 +152,16 @@ class GraphExecutor:
             self._run_layer(layer)
 
     def _run_layer(self, layer: list[SubTask]) -> None:
-        human_nodes = [n for n in layer if n.executor == "human"]
-        code_nodes = [n for n in layer if n.executor != "human"]
+        runnable: list[SubTask] = []
+        for node in layer:
+            blocked = self._blocked_predecessors(node.id)
+            if blocked:
+                self._skip_node(node, blocked)
+            else:
+                runnable.append(node)
+
+        human_nodes = [n for n in runnable if n.executor == "human"]
+        code_nodes = [n for n in runnable if n.executor != "human"]
         if code_nodes:
             self._run_code_nodes_parallel(code_nodes)
         for node in human_nodes:
@@ -192,82 +177,35 @@ class GraphExecutor:
         for th in threads:
             th.join()
 
-    # ================================================================
-    #  loop 执行
-    # ================================================================
     def _execute_with_loop(self) -> None:
-        graph = self.graph
-        # 模板编译出的图天然线性（nodes 已是 t1..tn 顺序），loop 只加回边
-        order = list(graph.nodes)
-        back = graph.loop_back_edges[0] if graph.loop_back_edges else None
-        loop_target = back.dst if back else (graph.entry or order[0].id)
-        loop_source = back.src if back else (graph.entry or order[-1].id)
+        """兼容旧调用者：旧图级 loop 也按普通 DAG 执行，避免整图重跑。"""
+        self._execute_dag()
 
-        idx_target = next((i for i, n in enumerate(order) if n.id == loop_target), 0)
-        idx_source = next((i for i, n in enumerate(order) if n.id == loop_source), len(order) - 1)
-        entry_nodes = order[:idx_target]
-        loop_body = order[idx_target : idx_source + 1]
-        exit_nodes = order[idx_source + 1 :]
-
-        # 1) entry 部分（loop 之前的节点）
-        for node in entry_nodes:
-            if self._quit.is_set():
-                return
-            self._run_node_single(node)
-
-        # 2) loop 迭代
-        feedback = ""
-        satisfied = False
-        for it in range(self.max_loop_iterations):
-            if self._quit.is_set():
-                break
-            for node in loop_body:
-                ctx = ""
-                if it > 0 and node.id == loop_target and feedback:
-                    ctx = f"[上一轮未通过] 反馈：{feedback}\n请据此修正后重新执行。"
-                self._run_node_single(node, extra_context=ctx)
-            verdict = self.judge(self.cfg, graph.exit_condition, self._context_snapshot())
-            satisfied = bool(verdict.get("satisfied", False))
-            feedback = str(verdict.get("feedback", ""))
-            console.status_line(
-                "✓" if satisfied else "↻",
-                f"loop 第 {it + 1}/{self.max_loop_iterations} 轮：退出条件{'满足' if satisfied else '未满足'} — {feedback[:120]}",
-                "green" if satisfied else "yellow",
-            )
-            if satisfied:
-                break
-        if not satisfied:
-            console.warn(f"loop 达 {self.max_loop_iterations} 轮仍未满足退出条件，交由外层决策")
-
-        # 3) loop 之后的节点
-        for node in exit_nodes:
-            if self._quit.is_set():
-                return
-            self._run_node_single(node)
-
-    def _context_snapshot(self) -> str:
-        parts: list[str] = []
-        if self.goal:
-            parts.append(f"总体目标：{self.goal}")
-        for nid, run in self.runs.items():
-            if run.output:
-                parts.append(f"[{nid}] {run.output[:2000]}")
-        if self.state:
-            parts.append("累计状态：" + json.dumps(self.state, ensure_ascii=False)[:2000])
-        return "\n".join(parts)
-
-    # ================================================================
-    #  单节点分派
-    # ================================================================
     def _run_node_single(self, node: SubTask, extra_context: str = "") -> None:
+        blocked = self._blocked_predecessors(node.id)
+        if blocked:
+            self._skip_node(node, blocked)
+            return
         if node.executor == "human":
             self._run_human_with_rerun(node)
         else:
             self._run_code_node(node, extra_context)
 
-    # ================================================================
-    #  code 节点执行
-    # ================================================================
+    def _blocked_predecessors(self, node_id: str) -> list[str]:
+        blocked: list[str] = []
+        for predecessor in self._predecessors(node_id):
+            run = self.runs.get(predecessor)
+            if run is None or run.status != "success":
+                blocked.append(predecessor)
+        return blocked
+
+    def _skip_node(self, node: SubTask, blocked: list[str]) -> None:
+        reason = "前置任务未成功：" + ", ".join(blocked)
+        run = TaskRun(task=node, workdir=str(self.workdir), status="skipped", error=reason)
+        self.runs[node.id] = run
+        console.status_line("↷", f"跳过 {node.id} [{node.executor}]：{reason}", "yellow")
+        self._emit(run, Event(kind="error", source="orchestrator", text=reason, data={"skipped": True}))
+
     def _run_code_node(self, node: SubTask, extra_context: str = "") -> TaskRun:
         workdir = str(self.workdir)
         run = TaskRun(task=node, workdir=workdir)
@@ -282,10 +220,11 @@ class GraphExecutor:
 
         prompt = self._prompt_for(node, extra_context)
         runner = runner_cls(self.cfg, run, workdir, self._emit, prompt, broker=self.broker)
+        if node.internal_loop is not None and hasattr(runner, "set_internal_loop"):
+            runner.set_internal_loop(node.internal_loop)
         with self._active_lock:
             self._active[node.id] = (runner, threading.current_thread())
         console.status_line("▶", f"启动 {node.id} [{node.executor}] {node.title}", "blue")
-        # 展示发给 code agent 的任务信息（minimal 下也可见，让用户知道 agent 收到了什么）
         if node.description:
             console.dim(f"   任务: {node.description.strip().splitlines()[0][:120]}")
         if node.acceptance:
@@ -295,7 +234,6 @@ class GraphExecutor:
             runner.start()
             deadline = time.time() + self.cfg.timeout_per_task
             while not runner.is_done() and not self._quit.is_set():
-                # runner 等待审批时不触发超时（用户可能正在决策）
                 pending = getattr(runner, "pending_approval_ids", None)
                 if pending:
                     deadline = max(deadline, time.time() + 60)
@@ -333,6 +271,25 @@ class GraphExecutor:
             parts.append(f"总体目标：{self.goal}")
         parts.append(f"任务 {node.id}: {node.title}")
         parts.append(node.description)
+        parts.append(
+            f"共享工作目录：{self.workdir}\n"
+            "请先读取该目录中前置 agent 已产生的代码和文件，再继续本任务；"
+            "不要重复从零分析整个模板。"
+        )
+        if node.tool:
+            parts.append(f"指定工具/技能：{node.tool}\n请将其作为本任务的执行工具提示；如果当前执行器没有该工具，明确报告缺失，不要改为分析模板本身。")
+        if node.internal_loop is not None and node.internal_loop.enabled:
+            loop = node.internal_loop
+            loop_prompt = (
+                f"本任务包含内部迭代：最多执行 {loop.max_iterations} 轮。"
+                "请在当前任务内部完成检查、修正、重试，不要等待编排器重新启动整个任务图。"
+                "如果 executor 使用 Codex App Server，编排器会依据结构化 status 在同一 thread 上开启后续 turn。"
+            )
+            if loop.exit_condition:
+                loop_prompt += f"\n内部循环退出条件：{loop.exit_condition}"
+            if loop.feedback_prompt:
+                loop_prompt += f"\n迭代要求：{loop.feedback_prompt}"
+            parts.append(loop_prompt)
         if node.acceptance:
             parts.append(f"完成标准: {node.acceptance}")
         deps = [d for d in self._predecessors(node.id) if d in self.runs and self.runs[d].output]
@@ -352,9 +309,6 @@ class GraphExecutor:
     def _predecessors(self, node_id: str) -> list[str]:
         return [e.src for e in self.graph.edges if e.dst == node_id]
 
-    # ================================================================
-    #  human 审查节点（阻塞 + 驳回重跑上游）
-    # ================================================================
     def _run_human_with_rerun(self, node: SubTask) -> None:
         while not self._quit.is_set():
             decision = self._run_human_node(node)
@@ -369,7 +323,6 @@ class GraphExecutor:
                 if pred is not None and pred.executor != "human":
                     console.status_line("↩", f"审查驳回，重跑上游 {pred.id} [{pred.executor}]", "yellow")
                     self._run_code_node(pred, extra_context=f"[审查驳回反馈] {feedback}\n请据此修改后再执行。")
-            # 循环回到审查节点
 
     def _run_human_node(self, node: SubTask) -> dict:
         req_id = f"review-{node.id}-{int(time.time() * 1000)}"

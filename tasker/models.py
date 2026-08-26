@@ -1,13 +1,10 @@
-"""核心数据模型：计划、子任务、事件、任务运行记录。"""
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-# executor 允许值：claude/codex 交给对应 CLI；human 为「人工审查点」（阻塞等用户决定）
 EXECUTORS = ("claude", "codex", "human", "llm")
-# 事件种类
 EVENT_KINDS = (
     "thinking",            # 思维链 / 推理
     "text",                # 普通文本输出
@@ -19,6 +16,7 @@ EVENT_KINDS = (
     "review_result",       # 人工审查决定（含反馈）
     "user_message",        # 注入给执行器的用户消息
     "interaction",         # 其它交互事件（子代理、系统通知等）
+    "usage",               # token / cost 统计（详情模式）
     "system",              # 系统事件
     "error",               # 错误
     "result",              # 最终结果
@@ -27,8 +25,16 @@ EVENT_KINDS = (
 
 
 @dataclass
+class TaskLoop:
+
+    enabled: bool = False
+    max_iterations: int = 5
+    exit_condition: str = ""
+    feedback_prompt: str = ""
+
+
+@dataclass
 class SubTask:
-    """一个可交给 claude / codex 执行的子任务。"""
 
     id: str
     title: str
@@ -36,8 +42,9 @@ class SubTask:
     executor: str = "claude"
     depends_on: list[str] = field(default_factory=list)
     acceptance: str = ""
-    # 注入执行器 prompt 的额外上下文（由调度器填充前置任务输出）
+    tool: str = ""
     context: str = ""
+    internal_loop: TaskLoop | None = None
 
 
 @dataclass
@@ -48,21 +55,18 @@ class Plan:
     tasks: list[SubTask] = field(default_factory=list)
     rationale: str = ""
     raw_llm_output: str = ""
-    # LLM 选择使用的模板名（None 表示未用模板）
     template: Optional[str] = None
+    orchestration: dict = field(default_factory=dict)
 
 
 @dataclass
 class GraphEdge:
-    """一条有向边（复刻 LangGraph add_edge 的 (src, dst) 语义）。"""
-
     src: str
     dst: str
 
 
 @dataclass
 class ConditionalBranch:
-    """条件边的一个分支：满足 condition 时走向 dst（dst 可为 __end__）。"""
 
     condition: str
     dst: str
@@ -70,7 +74,6 @@ class ConditionalBranch:
 
 @dataclass
 class ConditionalEdge:
-    """条件边（复刻 LangGraph add_conditional_edges 的 from + branches 语义）。"""
 
     src: str
     branches: list[ConditionalBranch] = field(default_factory=list)
@@ -78,11 +81,6 @@ class ConditionalEdge:
 
 @dataclass
 class CompiledGraph:
-    """模板/计划编译出的可执行图（LangGraph「样子」，但不依赖 langgraph）。
-
-    nodes 复用 SubTask（executor 可为 claude/codex/human）。
-    loop=True 时 executor 沿 loop_back_edges 迭代，直到 exit_condition 满足。
-    """
 
     nodes: list[SubTask] = field(default_factory=list)
     edges: list[GraphEdge] = field(default_factory=list)
@@ -100,18 +98,15 @@ class CompiledGraph:
         return None
 
     def successors(self, node_id: str) -> list[str]:
-        """普通边的后继。"""
         return [e.dst for e in self.edges if e.src == node_id]
 
     @property
     def real_node_ids(self) -> list[str]:
-        """排除 finish（__end__）等伪节点的真实节点 id 列表。"""
         return [n.id for n in self.nodes]
 
 
 @dataclass
 class Session:
-    """一次目标任务的持久化状态，支持续跑直到 goal 达成。"""
 
     session_id: str = ""
     goal: str = ""
@@ -126,7 +121,6 @@ class Session:
 
 @dataclass
 class Event:
-    """一条采集到的事件（思维链 / 工具调用 / 审批等）。"""
 
     kind: str
     source: str  # claude | codex | planner | orchestrator
@@ -135,7 +129,6 @@ class Event:
     ts: float = field(default_factory=time.time)
 
     def summary(self, width: int = 90) -> str:
-        """生成一行用于控制台/报告概览的摘要。"""
         body = self.text.strip().replace("\n", " ")
         if len(body) > width:
             body = body[: width - 1] + "…"
@@ -165,6 +158,8 @@ class Event:
             return f"👤 注入消息 {body}"
         if self.kind == "interaction":
             return f"🔁 交互 {body}"
+        if self.kind == "usage":
+            return f"📊 用量 {body}"
         if self.kind == "error":
             return f"❌ 错误 {body}"
         if self.kind == "result":
@@ -182,10 +177,6 @@ def _compact(obj, width: int) -> str:
     return s if len(s) <= width else s[: width - 1] + "…"
 
 
-# ================================================================
-#  序列化：SubTask / CompiledGraph 与 dict 互转
-#  （session.py 存 plan.json、template_compiler.py 存编译缓存共用）
-# ================================================================
 def subtask_to_dict(t: SubTask) -> dict:
     return {
         "id": t.id,
@@ -194,8 +185,38 @@ def subtask_to_dict(t: SubTask) -> dict:
         "executor": t.executor,
         "depends_on": list(t.depends_on),
         "acceptance": t.acceptance,
+        "tool": t.tool,
         "context": t.context,
+        "internal_loop": task_loop_to_dict(t.internal_loop),
     }
+
+
+def task_loop_to_dict(loop: TaskLoop | None) -> dict | None:
+    if loop is None:
+        return None
+    return {
+        "enabled": loop.enabled,
+        "max_iterations": loop.max_iterations,
+        "exit_condition": loop.exit_condition,
+        "feedback_prompt": loop.feedback_prompt,
+    }
+
+
+def task_loop_from_dict(value) -> TaskLoop | None:
+    if not isinstance(value, dict):
+        return None
+    if not bool(value.get("enabled", True)):
+        return None
+    try:
+        max_iterations = max(1, int(value.get("max_iterations", 5)))
+    except (TypeError, ValueError):
+        max_iterations = 5
+    return TaskLoop(
+        enabled=True,
+        max_iterations=max_iterations,
+        exit_condition=str(value.get("exit_condition", "") or ""),
+        feedback_prompt=str(value.get("feedback_prompt", "") or ""),
+    )
 
 
 def subtask_from_dict(d: dict) -> SubTask:
@@ -206,7 +227,9 @@ def subtask_from_dict(d: dict) -> SubTask:
         executor=str(d.get("executor", "claude")),
         depends_on=list(d.get("depends_on") or []),
         acceptance=str(d.get("acceptance", "")),
+        tool=str(d.get("tool", d.get("skill", "")) or ""),
         context=str(d.get("context", "")),
+        internal_loop=task_loop_from_dict(d.get("internal_loop", d.get("loop"))),
     )
 
 
@@ -250,11 +273,10 @@ def graph_from_dict(d: dict) -> CompiledGraph:
 
 @dataclass
 class TaskRun:
-    """一次子任务执行记录（含全部事件）。"""
 
     task: SubTask
     events: list[Event] = field(default_factory=list)
-    status: str = "pending"  # pending | running | success | failed | skipped
+    status: str = "pending"
     output: str = ""
     exit_code: Optional[int] = None
     error: str = ""

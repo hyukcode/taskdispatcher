@@ -1,13 +1,4 @@
-"""交互式 REPL：`tasker`（无参数）进入。
 
-双模式状态机：
-- Idle（`tasker>`）：读目标或 /sessions /resume /plan /config /help /quit。
-- Run：LiveTui 逐字符输入，goal loop 跑在后台线程；输入即：
-    @all/@claude/@codex/@<id> <msg>   中途注入
-    :allow [id] / :deny [id]          工具审批
-    :approve [id] / :reject <反馈>    人工审查点（驳回注回重跑）
-    :status / :plan / :quit
-"""
 from __future__ import annotations
 
 import threading
@@ -37,16 +28,16 @@ REPL_HELP = """\
 
 
 class Repl:
-    def __init__(self, cfg: Config, *, planner=None, evaluator=None, judge=None):
+    def __init__(self, cfg: Config, *, planner=None, evaluator=None, judge=None, template=None):
         self.cfg = cfg
         self.store = SessionStore(cfg.session)
         self.broker = ApprovalBroker(cfg.approval)
         self.session: Session | None = None
-        # 测试/定制注入：透传给 GoalLoop
         self.planner = planner
         self.evaluator = evaluator
         self.judge = judge
-        self._quit_requested = False  # Run 模式退出后回到 Idle 直接结束程序
+        self.template = template
+        self._quit_requested = False  
 
     def run(self) -> int:
         console.banner("tasker 交互式编排器")
@@ -71,7 +62,6 @@ class Repl:
                     break
         return 0
 
-    # ---------- Idle 命令 ----------
     def _idle_command(self, line: str) -> bool:
         parts = line[1:].split(None, 1)
         cmd = parts[0].lower()
@@ -139,10 +129,12 @@ class Repl:
         from .planner import plan_with_llm, plan_with_rules
 
         try:
-            plan = plan_with_rules(goal) if self.cfg.mock else plan_with_llm(goal, self.cfg, emit=lambda e: None)
+            plan = plan_with_rules(goal, template=self.template) if self.cfg.mock else plan_with_llm(
+                goal, self.cfg, emit=lambda e: None, template=self.template
+            )
         except LLMError as e:
             console.warn(f"拆分 LLM 不可用（{e}），用规则拆分")
-            plan = plan_with_rules(goal)
+            plan = plan_with_rules(goal, template=self.template)
         print(f"目标: {plan.objective}")
         if plan.template:
             print(f"模板: {plan.template}")
@@ -156,7 +148,6 @@ class Repl:
         print(f"approval.mode={c.approval.mode}   mock={c.mock}")
         print(f"session.dir={c.session.path}")
 
-    # ---------- Run 模式 ----------
     def _run_goal(self, goal: str, session: Session | None = None) -> None:
         if session is None:
             session = Session(session_id=new_session_id(), goal=goal)
@@ -167,10 +158,12 @@ class Repl:
         print(f"会话: {session.session_id}")
         print()
 
-        tui = LiveTui(think_level="off", display_level=self.cfg.display.level)
+        think_level = "off" if self.cfg.display.level == "minimal" else "full"
+        tui = LiveTui(think_level=think_level, display_level=self.cfg.display.level)
         loop = GoalLoop(
             self.cfg, self.broker, self.store, emit=tui.emit,
             planner=self.planner, evaluator=self.evaluator, judge=self.judge,
+            template=self.template,
         )
 
         def worker() -> None:
@@ -250,5 +243,5 @@ class Repl:
         print(f"会话 id: {session.session_id}（/resume {session.session_id} 可续跑）")
 
 
-def main_loop(cfg: Config) -> int:
-    return Repl(cfg).run()
+def main_loop(cfg: Config, *, template=None) -> int:
+    return Repl(cfg, template=template).run()

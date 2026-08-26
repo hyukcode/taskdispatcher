@@ -1,15 +1,4 @@
-"""ptty attach：把终端直接交给 claude/codex 的交互 TUI（macOS/Linux）。
 
-为什么需要它：claude -p / codex exec 在 headless 下不出现权限弹窗，
-真正的"审批请求"交互界面只在交互式 TUI 里有。attach 模式用 pty fork 出
-交互式进程，原样转发其字节流到你自己的终端 —— 你能亲眼看到并直接回答审批，
-也能像用原版 CLI 一样继续对话。
-
-注意：
-- 仅 macOS / Linux（Windows 无 pty）。
-- 与调度器并发不兼容：attach 是"独占终端"模式，一般单独运行。
-- 这是尽力而为转发，不解析 TUI 的 ANSI 光标控制；依赖目标 CLI 的交互界面。
-"""
 from __future__ import annotations
 
 import os
@@ -33,7 +22,6 @@ def run_attached(binary: str, workdir: str, prompt: str = "", raw_log: str = "")
 
     pid, master_fd = os.forkpty()
     if pid == 0:
-        # 子进程
         try:
             os.chdir(workdir)
             os.execvp(command[0], command)

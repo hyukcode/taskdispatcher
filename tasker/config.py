@@ -1,4 +1,3 @@
-"""配置加载：config.json + 环境变量合并。"""
 from __future__ import annotations
 
 import json
@@ -12,9 +11,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 @dataclass
 class LLMConfig:
-    """任务拆分用的 LLM 配置（也可直接接入 DeepSeek/OpenAI 等兼容接口）。"""
 
-    provider: str = "anthropic"  # anthropic | openai（openai 为兼容接口，可填任意 base_url）
+    provider: str = "anthropic"
     base_url: str = ""
     api_key_env: str = "ANTHROPIC_API_KEY"
     model: str = "claude-sonnet-5"
@@ -27,13 +25,9 @@ class LLMConfig:
 class ClaudeConfig:
     binary: str = "claude"
     model: str = ""
-    # default | acceptEdits | bypassPermissions | dontAsk | plan | manual
-    # 编排器建议用 acceptEdits：headless 下自动允许工作区内文件编辑；
-    # 要完全自主（含 Bash）再改 bypassPermissions。
     permission_mode: str = "acceptEdits"
     allowed_tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
-    # claude 输出最终 result 后，若无新注入/新活动，等待该秒数后关闭 stdin 收尾
     completion_idle: float = 5.0
     extra_args: list[str] = field(default_factory=list)
 
@@ -48,12 +42,8 @@ class CodexConfig:
     skip_git_check: bool = True
     full_trace: bool = True
     extra_args: list[str] = field(default_factory=list)
-    # app-server 模式（--no-app-server 可退回 codex exec）
     use_app_server: bool = True
-    # untrusted | on-failure | on-request | never — thread/start 的 approvalPolicy；
-    # 建议 on-request 让每个审批都到达 tasker 的审批策略
     approval_policy: str = "on-request"
-    # 最终 result 后的静默秒数（同 ClaudeConfig.completion_idle 语义）
     completion_idle: float = 5.0
 
 
@@ -70,39 +60,38 @@ class ApprovalConfig:
 class DispatchConfig:
     """任务分派策略。"""
 
-    # 真实节点数小于该值且无 human 节点 / 无 loop 时，折叠为单 agent 直接执行
     min_multiagent_steps: int = 3
+    strategy: str = "codex-first-review"
+    complex_executor: str = "codex"
+    implementation_executor: str = "claude"
+    verification_executor: str = "codex"
+    claude_model: str = "DeepSeek-v4-pro"
+    codex_model: str = "ChatGPT-5.6"
 
 
 @dataclass
 class GoalLoopConfig:
     """外层收敛循环配置。"""
 
-    max_iterations: int = 5  # 超限回 REPL 让用户决定（/continue /stop /replan）
-    evaluator: str = "claude"  # goal 达成判定的 code agent
-
+    max_iterations: int = 1 
+    evaluator: str = "codex"
 
 @dataclass
 class TemplateCompilerConfig:
-    """模板编译配置。"""
 
-    loop_infer: str = "llm"  # llm | off（off 时退化为线性 DAG，不调 LLM）
-    cache: bool = True  # 编译结果缓存，二次编译不重复调 LLM
-
+    loop_infer: str = "llm"
+    cache: bool = True
 
 @dataclass
 class DisplayConfig:
-    """REPL 显示级别。"""
 
-    level: str = "minimal"  # minimal | verbose
+    level: str = "minimal"  # minimal | verbose | debug
 
 
 @dataclass
 class SessionConfig:
-    """会话持久化配置。"""
 
     dir: str = "~/.tasker/sessions"
-    # 共享工作目录：固定到 ~/.tasker/ 下（和 config.json 一样用户级固定，不随 cwd/session 变化）
     workspace_dir: str = "~/.tasker/workspace"
 
     @property
@@ -133,7 +122,6 @@ class Config:
 
     @property
     def workspace_path(self) -> Path:
-        # 相对路径相对当前工作目录解析（而非包安装目录），pipx 安装下产物落在用户运行目录
         p = Path(self.workspace_dir)
         return p if p.is_absolute() else Path.cwd() / p
 
@@ -187,6 +175,12 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
     if "dispatch" in data:
         d = data["dispatch"]
         cfg.dispatch.min_multiagent_steps = int(d.get("min_multiagent_steps", cfg.dispatch.min_multiagent_steps))
+        cfg.dispatch.strategy = d.get("strategy", cfg.dispatch.strategy)
+        cfg.dispatch.complex_executor = d.get("complex_executor", cfg.dispatch.complex_executor)
+        cfg.dispatch.implementation_executor = d.get("implementation_executor", cfg.dispatch.implementation_executor)
+        cfg.dispatch.verification_executor = d.get("verification_executor", cfg.dispatch.verification_executor)
+        cfg.dispatch.claude_model = d.get("claude_model", cfg.dispatch.claude_model)
+        cfg.dispatch.codex_model = d.get("codex_model", cfg.dispatch.codex_model)
 
     if "goal_loop" in data:
         d = data["goal_loop"]
@@ -216,18 +210,10 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
 
 
 def _user_config_path() -> Path:
-    """用户级配置：~/.tasker/config.json（与模板库 ~/.tasker/templates/ 同级，不依赖当前目录）。"""
     return Path(os.path.expanduser("~")) / ".tasker" / "config.json"
 
 
 def load_config(path: str | Path | None = None, *, overrides: dict[str, Any] | None = None) -> Config:
-    """加载配置文件。缺省顺序（取第一个存在的文件）：
-    1. --config 显式指定
-    2. ./config.json（当前目录，便于项目级覆盖）
-    3. ~/.tasker/config.json（用户级，任意目录下都生效）
-    4. 包目录 config.json
-    5. 内置默认值
-    overrides 优先于文件。"""
     cfg = Config()
     if path:
         p = Path(path)
@@ -237,7 +223,7 @@ def load_config(path: str | Path | None = None, *, overrides: dict[str, Any] | N
     if p.exists():
         try:
             data = json.loads(p.read_text(encoding="utf-8"))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             raise ValueError(f"配置文件 {p} 解析失败: {e}") from e
         _merge_cfg(cfg, data)
     if overrides:
@@ -277,8 +263,16 @@ def save_example_config(path: str | Path) -> None:
             "completion_idle": 5.0,
         },
         "approval": {"mode": "auto", "default_allow": True, "timeout": 120},
-        "dispatch": {"min_multiagent_steps": 3},
-        "goal_loop": {"max_iterations": 5, "evaluator": "claude"},
+        "dispatch": {
+            "min_multiagent_steps": 3,
+            "strategy": "codex-first-review",
+            "complex_executor": "codex",
+            "implementation_executor": "claude",
+            "verification_executor": "codex",
+            "claude_model": "DeepSeek-v4-pro",
+            "codex_model": "ChatGPT-5.6",
+        },
+        "goal_loop": {"max_iterations": 1, "evaluator": "codex"},
         "template_compiler": {"loop_infer": "llm", "cache": True},
         "display": {"level": "minimal"},
         "session": {"dir": "~/.tasker/sessions", "workspace_dir": "~/.tasker/workspace"},

@@ -6,6 +6,8 @@
   编排器可以程序化批准/拒绝，实现和 SdkClaudeRunner.can_use_tool 对等的
   headless 审批能力。
 - 中途注入：turn/steer 可在 turn 进行中追加用户消息。
+- 任务内部 loop：turn/completed 返回 needs_iteration 时，在同一 thread 上
+  发起新的 turn/start，不重跑外层任务图。
 
 传输：codex app-server --listen stdio://
 协议：newline-delimited JSON（无 "jsonrpc":"2.0" 头），camelCase 字段。
@@ -20,7 +22,7 @@ import time
 from . import __version__
 from .approvals import ApprovalBroker
 from .config import Config
-from .models import Event, TaskRun
+from .models import Event, TaskLoop, TaskRun
 from .spawn import ProcChannel, resolve_binary, start_process
 
 # ---- 审批相关的 server→client 请求方法 ----
@@ -43,6 +45,16 @@ _ITEM_TOOL_MAP: dict[str, str] = {
     "imageGeneration": "image_generation",
     "memoryRead": "memory_read",
     "memoryWrite": "memory_write",
+}
+
+_LOOP_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["passed", "needs_iteration"]},
+        "feedback": {"type": "string"},
+    },
+    "required": ["status", "feedback"],
+    "additionalProperties": False,
 }
 
 
@@ -79,6 +91,17 @@ class CodexAppServerRunner:
         self._settle = float(getattr(cfg.codex, "completion_idle", 5.0))
         self._steer_queue: list[str] = []
         self._steer_lock = threading.Lock()
+        self._turn_active = False
+        self._pending_turn_starts: dict[int, bool] = {}
+        self._turn_output = ""
+        self._internal_loop: TaskLoop | None = None
+        self._loop_iteration = 0
+
+    def set_internal_loop(self, loop: TaskLoop | None) -> None:
+        """配置任务内部 loop；必须在 start() 前调用。"""
+        self._internal_loop = loop if loop and loop.enabled else None
+        if self._internal_loop is not None:
+            self._internal_loop.max_iterations = max(1, int(self._internal_loop.max_iterations))
 
     # ---------- 生命周期 ----------
     def build_args(self) -> list[str]:
@@ -130,23 +153,17 @@ class CodexAppServerRunner:
         self._injection_ts = time.time()
         self._emit(Event(kind="user_message", source=self.source, text=text))
         with self._steer_lock:
-            if not self._handshake_ok or not self._turn_id:
+            if not self._handshake_ok or not self._thread_id:
                 self._steer_queue.append(text)
                 return True
-        rid = self._next_id()
-        ok = self._write(
-            {
-                "id": rid,
-                "method": "turn/steer",
-                "params": {
-                    "threadId": self._thread_id,
-                    "turnId": self._turn_id,
-                    "input": [{"type": "text", "text": text}],
-                    "expectedTurnId": self._turn_id,
-                },
-            }
-        )
-        return ok
+            if self._turn_active and self._turn_id and not self._pending_turn_starts:
+                self._send_steer(text)
+                return True
+            # turn/completed 之后必须开启新的 turn，不能再 steer 已结束的 turn。
+            if self._pending_turn_starts:
+                self._steer_queue.append(text)
+                return True
+        return self._start_followup_turn(text, internal=False)
 
     # ---------- 审批接口（duck-typed，供 scheduler 的 :allow/:deny 路由）----------
     @property
@@ -232,8 +249,10 @@ class CodexAppServerRunner:
                 "method": "thread/start",
                 "params": {
                     "cwd": self.workdir,
+                    # 当前本机 codex-cli 0.147.0 的 thread/start 仍要求旧的
+                    # kebab-case 字符串；turn/start 使用新版 sandboxPolicy 对象。
                     "sandbox": c.sandbox,
-                    "approvalPolicy": c.approval_policy,
+                    "approvalPolicy": _approval_policy(c.approval_policy),
                     **({"model": c.model} if c.model else {}),
                 },
             }
@@ -254,6 +273,7 @@ class CodexAppServerRunner:
             return
 
         # 4) turn/start
+        self._reset_turn_output()
         rid = self._next_id()
         self._write(
             {
@@ -261,10 +281,12 @@ class CodexAppServerRunner:
                 "method": "turn/start",
                 "params": {
                     "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": self.prompt}],
+                    "input": [{"type": "text", "text": self._initial_prompt()}],
                     "cwd": self.workdir,
-                    "approvalPolicy": c.approval_policy,
+                    "approvalPolicy": _approval_policy(c.approval_policy),
+                    "sandboxPolicy": _sandbox_policy(c.sandbox, self.workdir),
                     **({"model": c.model} if c.model else {}),
+                    **({"outputSchema": _LOOP_OUTPUT_SCHEMA} if self._internal_loop else {}),
                 },
             }
         )
@@ -283,6 +305,7 @@ class CodexAppServerRunner:
             self._emit(Event(kind="error", source=self.source, text="turn/start 未返回 turn.id"))
             return
 
+        self._turn_active = True
         self._handshake_ok = True
         self.run.exit_code = 0
         self._emit(
@@ -330,6 +353,29 @@ class CodexAppServerRunner:
         has_method = "method" in msg
 
         if has_id and not has_method:
+            pending_loop = self._pending_turn_starts.pop(msg.get("id"), None)
+            if pending_loop is not None:
+                if "error" in msg:
+                    self._turn_active = False
+                    self._finish_failure(f"turn/start 失败: {_compact(msg['error'], 500)}")
+                    return
+                result = msg.get("result") or {}
+                turn = result.get("turn", result)
+                self._turn_id = turn.get("id") or self._turn_id
+                self._turn_active = bool(self._turn_id)
+                if not self._turn_active:
+                    self._finish_failure("follow-up turn/start 未返回 turn.id")
+                    return
+                self._emit(
+                    Event(
+                        kind="system",
+                        source=self.source,
+                        text=f"内部 loop turn={self._turn_id[:8]}… 第 {self._loop_iteration + 1} 轮",
+                        data={"thread_id": self._thread_id, "turn_id": self._turn_id, "internal_loop": True},
+                    )
+                )
+                self._flush_queued_steers()
+                return
             if "error" in msg:
                 self._emit(
                     Event(
@@ -362,18 +408,19 @@ class CodexAppServerRunner:
                     kind="system",
                     source=self.source,
                     text=f"thread/started id={thread.get('id','')[:8]}…",
-                    data=thread,
+                    data={**thread, "display": True},
                 )
             )
         elif method == "turn/started":
             turn = params.get("turn", params)
-            self._turn_id = self._turn_id or turn.get("id")
+            self._turn_id = turn.get("id") or self._turn_id
+            self._turn_active = True
             self._emit(
                 Event(
                     kind="system",
                     source=self.source,
                     text=f"turn/started id={turn.get('id','')[:8]}… status={turn.get('status','')}",
-                    data=turn,
+                    data={**turn, "display": True},
                 )
             )
         elif method == "turn/completed":
@@ -382,20 +429,28 @@ class CodexAppServerRunner:
             self._closed = True
             if self._result_ts is None:
                 self._result_ts = time.time()
-            self._emit(Event(kind="system", source=self.source, text="thread/closed", data=params))
+            self._emit(Event(kind="system", source=self.source, text="thread/closed", data={**params, "display": True}))
         elif method == "thread/tokenUsage/updated":
             usage = params.get("tokenUsage") or params
             total = usage.get("total", usage)
             cost = float(total.get("total_cost_usd") or 0.0)
             if cost:
                 self.run.cost_usd = cost
+            self._emit(
+                Event(
+                    kind="usage",
+                    source=self.source,
+                    text=_usage_text(total),
+                    data=dict(total) if isinstance(total, dict) else {"value": total},
+                )
+            )
         elif method == "thread/environment/connected":
             self._emit(
                 Event(
                     kind="system",
                     source=self.source,
                     text=f"environment/connected {_compact(params, 200)}",
-                    data=params,
+                    data={**params, "display": True},
                 )
             )
         elif method == "item/started":
@@ -408,12 +463,39 @@ class CodexAppServerRunner:
             self._buffer_delta(params.get("itemId", ""), "thinking", params.get("delta", ""))
         elif method == "item/reasoning/summaryPartAdded":
             self._buffer_delta(params.get("itemId", ""), "thinking", params.get("summary", ""))
+        elif method == "item/plan/delta":
+            self._buffer_delta(params.get("itemId", ""), "plan", params.get("delta", ""))
         elif method == "item/completed":
             self._handle_item_completed(params)
         elif method == "item/commandExecution/outputDelta":
             pass  # 工具 stdout 流，不 flood 事件流（最终 tool_result 里有 output）
         elif method == "turn/diff/updated":
-            pass  # diff 快照，用于 UI；编排器暂不需要
+            self._emit(
+                Event(
+                    kind="interaction",
+                    source=self.source,
+                    text=f"文件变更：{_compact(params, 240)}",
+                    data={"diff": params, "display_detail": True},
+                )
+            )
+        elif method == "turn/plan/updated":
+            self._emit(
+                Event(
+                    kind="interaction",
+                    source=self.source,
+                    text=f"计划更新：{_compact(params, 240)}",
+                    data={"plan": params, "display_detail": True},
+                )
+            )
+        elif method in ("hook/started", "hook/completed", "model/safetyBuffering/updated", "model/verification", "contextCompaction"):
+            self._emit(
+                Event(
+                    kind="system",
+                    source=self.source,
+                    text=f"{method}: {_compact(params, 200)}",
+                    data=params,
+                )
+            )
         elif method == "serverRequest/resolved":
             pass  # 审批已解决，确认信号
         elif method == "error":
@@ -480,6 +562,16 @@ class CodexAppServerRunner:
                     },
                 )
             )
+        elif item_type == "plan":
+            self._buffers.setdefault(item_id, {"kind": "plan", "parts": []})
+            self._emit(
+                Event(
+                    kind="interaction",
+                    source=self.source,
+                    text=f"计划开始：{_compact(item, 220)}",
+                    data={"plan": item, "item_id": item_id, "display_detail": True},
+                )
+            )
 
     def _buffer_delta(self, item_id: str, kind: str, delta: str) -> None:
         if not delta:
@@ -500,7 +592,17 @@ class CodexAppServerRunner:
         if buf and buf["parts"]:
             text = "".join(buf["parts"])
             kind = "text" if buf["kind"] == "text" else "thinking"
-            self._emit(Event(kind=kind, source=self.source, text=text, data={"item_id": item_id}))
+            if buf["kind"] == "plan":
+                self._emit(
+                    Event(
+                        kind="interaction",
+                        source=self.source,
+                        text=f"计划：{text}",
+                        data={"item_id": item_id, "plan": text, "display_detail": True},
+                    )
+                )
+            else:
+                self._emit(Event(kind=kind, source=self.source, text=text, data={"item_id": item_id}))
 
         # tool 类 item：发 tool_result
         if item_type in _ITEM_TOOL_MAP or item_type in (
@@ -532,8 +634,22 @@ class CodexAppServerRunner:
         # agentMessage 完整文本（如果没有 delta 过，这里拿全文）
         elif item_type == "agentMessage" and not (buf and buf["parts"]):
             text = item.get("text", "")
+            self._turn_output = str(text or "")
             if text:
                 self._emit(Event(kind="text", source=self.source, text=str(text), data={"item_id": item_id}))
+        elif item_type == "agentMessage" and buf and buf["parts"]:
+            self._turn_output = "".join(buf["parts"])
+        elif item_type == "plan" and not (buf and buf["parts"]):
+            text = item.get("text", "") or item.get("plan", "")
+            if text:
+                self._emit(
+                    Event(
+                        kind="interaction",
+                        source=self.source,
+                        text=f"计划：{_compact(text, 500)}",
+                        data={"item_id": item_id, "plan": text, "display_detail": True},
+                    )
+                )
         elif item_type == "reasoning" and not (buf and buf["parts"]):
             text = item.get("text", "")
             if text:
@@ -543,14 +659,29 @@ class CodexAppServerRunner:
         turn = params.get("turn", params)
         status = turn.get("status", "completed")
         self._turn_status = status
+        self._turn_active = False
         self._result_ts = time.time()
 
         # flush 剩余缓冲
         for item_id, buf in list(self._buffers.items()):
             if buf["parts"]:
-                kind = "text" if buf["kind"] == "text" else "thinking"
-                self._emit(Event(kind=kind, source=self.source, text="".join(buf["parts"]), data={"item_id": item_id}))
+                text = "".join(buf["parts"])
+                if buf["kind"] == "plan":
+                    self._emit(
+                        Event(
+                            kind="interaction",
+                            source=self.source,
+                            text=f"计划：{text}",
+                            data={"item_id": item_id, "plan": text, "display_detail": True},
+                        )
+                    )
+                else:
+                    kind = "text" if buf["kind"] == "text" else "thinking"
+                    self._emit(Event(kind=kind, source=self.source, text=text, data={"item_id": item_id}))
         self._buffers.clear()
+
+        output = _turn_output(turn, self._turn_output)
+        self.run.output = output
 
         if status == "failed":
             error_info = turn.get("error", {})
@@ -575,6 +706,29 @@ class CodexAppServerRunner:
             )
             return
 
+        decision = _loop_decision(output) if self._internal_loop and status == "completed" else None
+        if (
+            decision
+            and decision.get("status") == "needs_iteration"
+            and self._internal_loop is not None
+            and self._loop_iteration + 1 < self._internal_loop.max_iterations
+        ):
+            self._loop_iteration += 1
+            feedback = str(decision.get("feedback") or "请重新检查任务结果，修正未满足的验收条件。")
+            self.run.exit_code = None
+            self.run.status = "running"
+            self._result_ts = None
+            self._emit(
+                Event(
+                    kind="interaction",
+                    source=self.source,
+                    text=f"任务内部 loop：第 {self._loop_iteration} 轮未满足，继续当前 thread",
+                    data={"internal_loop": True, "iteration": self._loop_iteration, "feedback": feedback},
+                )
+            )
+            self._start_followup_turn(self._loop_prompt(feedback), internal=True)
+            return
+
         # completed / interrupted
         self.run.exit_code = 0
         self.run.status = "success"
@@ -589,7 +743,7 @@ class CodexAppServerRunner:
         if not output_parts:
             # fallback：从 buffered text 中取
             output_parts.append("")
-        self.run.output = output_parts[0] if output_parts else ""
+        self.run.output = output or (output_parts[0] if output_parts else "")
 
         self._emit(
             Event(
@@ -600,6 +754,9 @@ class CodexAppServerRunner:
                     "status": status,
                     "cost_usd": self.run.cost_usd,
                     "turn_id": self._turn_id,
+                    "internal_loop": bool(self._internal_loop),
+                    "loop_iterations": self._loop_iteration + 1,
+                    "loop_decision": decision,
                 },
             )
         )
@@ -677,7 +834,7 @@ class CodexAppServerRunner:
                 rid,
                 result={
                     "action": "accept" if allowed else "decline",
-                    "content": "",
+                    "content": {} if allowed else None,
                 },
             )
         elif method == "item/tool/requestUserInput":
@@ -726,12 +883,84 @@ class CodexAppServerRunner:
                 "method": "turn/steer",
                 "params": {
                     "threadId": self._thread_id,
-                    "turnId": self._turn_id,
                     "input": [{"type": "text", "text": text}],
                     "expectedTurnId": self._turn_id,
                 },
             }
         )
+
+    def _initial_prompt(self) -> str:
+        if self._internal_loop is None:
+            return self.prompt
+        loop = self._internal_loop
+        return (
+            f"{self.prompt}\n\n"
+            "这是一个由 Codex App Server 驱动的任务内部迭代。请实际检查工作区和验收条件；"
+            "如果已经满足，返回 status=passed；如果不满足，先尽可能修正，并返回 status=needs_iteration "
+            "以及具体 feedback。不要要求编排器重跑整张任务图。"
+            f"最多允许 {loop.max_iterations} 个内部 turn。"
+        )
+
+    def _loop_prompt(self, feedback: str) -> str:
+        extra = self._internal_loop.feedback_prompt if self._internal_loop else ""
+        return (
+            "继续当前任务的内部迭代。请根据上一轮反馈检查实际文件、运行必要的验证并修正问题。\n"
+            f"上一轮反馈：{feedback}\n"
+            f"额外迭代要求：{extra or '无'}\n"
+            "完成后仍然只按约定的结构化结果报告：status=passed 或 status=needs_iteration，并给出 feedback。"
+        )
+
+    def _reset_turn_output(self) -> None:
+        self._turn_output = ""
+        self._buffers.clear()
+
+    def _start_followup_turn(self, text: str, *, internal: bool) -> bool:
+        """在同一个 thread 上启动新 turn；turn/steer 只用于 active turn。"""
+        if not self._thread_id or not self.channel or not self.channel.is_alive():
+            return False
+        self._reset_turn_output()
+        self._turn_active = False
+        self._turn_status = "inProgress"
+        self._result_ts = None
+        rid = self._next_id()
+        self._pending_turn_starts[rid] = internal
+        c = self.cfg.codex
+        ok = self._write(
+            {
+                "id": rid,
+                "method": "turn/start",
+                "params": {
+                    "threadId": self._thread_id,
+                    "input": [{"type": "text", "text": text}],
+                    "cwd": self.workdir,
+                    "approvalPolicy": _approval_policy(c.approval_policy),
+                    "sandboxPolicy": _sandbox_policy(c.sandbox, self.workdir),
+                    **({"model": c.model} if c.model else {}),
+                    **({"outputSchema": _LOOP_OUTPUT_SCHEMA} if self._internal_loop else {}),
+                },
+            }
+        )
+        if not ok:
+            self._pending_turn_starts.pop(rid, None)
+            self._finish_failure("无法发送 follow-up turn/start")
+        return ok
+
+    def _flush_queued_steers(self) -> None:
+        with self._steer_lock:
+            queued = list(self._steer_queue)
+            self._steer_queue.clear()
+            if self._turn_active and self._turn_id:
+                for text in queued:
+                    self._send_steer(text)
+            else:
+                self._steer_queue[:0] = queued
+
+    def _finish_failure(self, message: str) -> None:
+        self.run.exit_code = 1
+        self.run.status = "failed"
+        self.run.output = message
+        self._result_ts = time.time()
+        self._emit(Event(kind="error", source=self.source, text=message))
 
 
 def _compact(obj, width: int) -> str:
@@ -741,3 +970,94 @@ def _compact(obj, width: int) -> str:
     except Exception:  # noqa: BLE001
         s = str(obj)
     return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def _usage_text(usage) -> str:
+    """将 App Server 的 token/cost 统计压成一行详情。"""
+    if not isinstance(usage, dict):
+        return _compact(usage, 180)
+    labels = (
+        ("input_tokens", "in"),
+        ("output_tokens", "out"),
+        ("total_tokens", "total"),
+        ("total_cost_usd", "cost"),
+    )
+    parts = [f"{label}={usage[key]}" for key, label in labels if usage.get(key) is not None]
+    return " ".join(parts) or _compact(usage, 180)
+
+
+def _approval_policy(value: str) -> str:
+    """转成本机 codex-cli 0.147 app-server 实际接受的 wire 值。
+
+    官方文档已经列出 camelCase 的 onRequest/unlessTrusted，但 0.147.0
+    的协议实现仍接受 on-request/untrusted；保留两套配置输入的兼容性。
+    """
+    return {
+        "onRequest": "on-request",
+        "on-request": "on-request",
+        "onFailure": "on-failure",
+        "on-failure": "on-failure",
+        "unlessTrusted": "untrusted",
+        "unless-trusted": "untrusted",
+        "untrusted": "untrusted",
+        "granular": "granular",
+        "never": "never",
+    }.get(str(value or "").strip(), "on-request")
+
+
+def _sandbox_mode(value: str) -> str:
+    """thread/start 的 sandbox 使用协议中的 camelCase 模式名。"""
+    return {
+        "read-only": "readOnly",
+        "workspace-write": "workspaceWrite",
+        "danger-full-access": "dangerFullAccess",
+    }.get(str(value or "").strip(), str(value or "workspaceWrite"))
+
+
+def _sandbox_policy(value: str, workdir: str) -> dict:
+    """turn/start 的 sandboxPolicy 使用当前协议对象，而不是旧字符串。"""
+    mode = _sandbox_mode(value)
+    if mode == "workspaceWrite":
+        return {"type": mode, "writableRoots": [workdir]}
+    return {"type": mode}
+
+
+def _turn_output(turn: dict, fallback: str) -> str:
+    """从 completed turn 中提取最终 agentMessage；item 事件是主要来源。"""
+    for key in ("structuredOutput", "structured_output", "output"):
+        value = turn.get(key)
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, str) and value.strip():
+            return value
+    for item in reversed(turn.get("items") or []):
+        if isinstance(item, dict) and item.get("type") == "agentMessage":
+            value = item.get("text", "")
+            if isinstance(value, str) and value.strip():
+                return value
+    return fallback or ""
+
+
+def _loop_decision(output: str) -> dict | None:
+    """解析 outputSchema 结果；兼容少数版本仍把 JSON 包在 markdown 中的情况。"""
+    text = (output or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    if "```" in text:
+        candidates.extend(part.strip() for part in text.split("```") if part.strip())
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            start = candidate.find("{")
+            if start < 0:
+                continue
+            try:
+                value, _ = decoder.raw_decode(candidate[start:])
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, dict) and value.get("status") in {"passed", "needs_iteration"}:
+            return value
+    return None

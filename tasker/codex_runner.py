@@ -1,12 +1,4 @@
-"""Codex CLI 采集器。
 
-headless 方式：codex exec --json [--full-trace]
-- stdout 逐行是 JSON 事件：message（含 reasoning=思维链 / text / tool_call）、
-  tool_call、tool_call_output、approval_request（审批请求）、completed。
-- 说明：codex exec 是单轮非交互模式，**不支持**像 claude 那样从中途注入消息。
-  send_message() 会把消息记入 run 的 interactions，并在依赖该任务的下一批子任务
-  上下文中携带（相当于"下一轮注入"）。真正的实时审批/对话请用 ptty attach 模式。
-"""
 from __future__ import annotations
 
 import json
@@ -18,13 +10,11 @@ from .config import Config
 from .models import Event, TaskRun
 from .spawn import resolve_binary, start_process
 
-# codex 事件里"思维链"可能出现的字段名
 _REASON_FIELDS = ("reasoning", "reasoning_content", "thinking", "chain_of_thought")
 
 
 class CodexRunner:
     source = "codex"
-    # 审批请求由本 runner 自行处理，调度器的 ApprovalPolicy 不要插手
     self_handles_approval = True
 
     def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
@@ -59,7 +49,6 @@ class CodexRunner:
     def start(self):
         self.run.started_at = time.time()
         args = self.build_args()
-        # prompt 作为位置参数传入；stdin 保持打开以便尝试注入
         self.channel = start_process(args + [self.prompt], workdir=self.workdir, name=f"codex-{self.run.task.id}")
         self._thread = threading.Thread(target=self._pump, daemon=True, name=f"codex-{self.run.task.id}")
         self._thread.start()
@@ -79,7 +68,6 @@ class CodexRunner:
         return self.broker.pending_ids
 
     def approval_respond(self, req_id: str, allowed: bool) -> bool:
-        """调度器 :allow/:deny 送达：解除 pump 线程的阻塞等待。"""
         return self.broker.resolve(req_id, allowed=allowed)
 
     def stop(self) -> None:
@@ -91,7 +79,6 @@ class CodexRunner:
         return bool(self.channel and self.channel.is_alive())
 
     def is_done(self) -> bool:
-        # codex exec 完成 `completed` 事件后会自行退出
         return not self.is_alive()
 
     def finalize(self) -> None:

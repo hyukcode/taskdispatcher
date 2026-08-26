@@ -1,14 +1,3 @@
-"""模板编译：把普通模板（suggested_tasks 线性列表）编译成可执行图。
-
-节点机械生成：每条 suggested_tasks → SubTask(id=t1..tn，executor 占位 claude)。
-loop 判断：把步骤清单交给 LLM（规则写在 LOOP_INFER_PROMPT 里），返回固定 JSON
-  {loop, exit_condition, loop_back_edges, conditional_edges, rationale}，
-  覆盖到默认线性 DAG 上（conditional edge 取代对应 src 的普通出边）。
-缓存：编译结果写到 ~/.tasker/compiled/，按模板内容 hash 键控，二次编译直接读。
-兜底：LLM 失败 → loop=false 线性 DAG（漏判的 loop 由外层 goal loop + evaluator 兜住）。
-
-模板格式不动（tp-wy 包零改动）。
-"""
 
 from __future__ import annotations
 
@@ -27,6 +16,7 @@ from .models import (
     SubTask,
     graph_from_dict,
     graph_to_dict,
+    task_loop_from_dict,
 )
 
 LOOP_INFER_PROMPT = """\
@@ -59,7 +49,6 @@ LOOP_INFER_PROMPT = """\
 
 
 def _extract_json(text: str) -> dict:
-    """从 LLM 返回文本中提取 JSON 对象（与 planner._extract_json 同逻辑）。"""
     text = text.strip()
     if text.startswith("```"):
         import re
@@ -72,12 +61,8 @@ def _extract_json(text: str) -> dict:
         raise LLMError("LLM 返回内容中没有 JSON 对象")
     return json.loads(text[start : end + 1])
 
-
-# ================================================================
-#  节点 / 线性图（机械生成）
-# ================================================================
-def nodes_from_template(template: dict) -> list[SubTask]:
-    """每条 suggested_tasks → 一个 SubTask（executor 占位 claude，由 planner 阶段覆盖）。"""
+def nodes_from_template(template: dict, default_executor: str = "codex") -> list[SubTask]:
+    """每条 suggested_tasks → 一个 SubTask；planner 编排结果会覆盖 executor。"""
     suggested = template.get("suggested_tasks") or []
     nodes: list[SubTask] = []
     for i, t in enumerate(suggested, start=1):
@@ -87,24 +72,22 @@ def nodes_from_template(template: dict) -> list[SubTask]:
                 id=tid,
                 title=str(t.get("title") or tid),
                 description=str(t.get("description") or ""),
-                executor="claude",
+                executor=str(t.get("executor") or default_executor),
                 depends_on=[],
                 acceptance=str(t.get("acceptance") or ""),
+                tool=str(t.get("tool") or t.get("skill") or ""),
+                internal_loop=task_loop_from_dict(t.get("internal_loop", t.get("loop"))),
             )
         )
     return nodes
 
 
 def linear_graph(nodes: list[SubTask]) -> CompiledGraph:
-    """默认无 loop：线性边 t1→t2→…→tn，末节点无出边即终止。"""
     edges = [GraphEdge(src=nodes[i].id, dst=nodes[i + 1].id) for i in range(len(nodes) - 1)]
     entry = nodes[0].id if nodes else ""
     return CompiledGraph(nodes=nodes, edges=edges, entry=entry)
 
 
-# ================================================================
-#  loop 推断（LLM）
-# ================================================================
 def _steps_text(template: dict) -> str:
     lines = [f"模板名: {template.get('template_name', '')}"]
     suggested = template.get("suggested_tasks") or []
@@ -120,7 +103,6 @@ def _steps_text(template: dict) -> str:
 
 
 def _infer_loop(cfg: Config, template: dict) -> dict:
-    """调用 LLM 判断 loop，返回结构化信息；失败返回 loop=false。"""
     user = _steps_text(template)
     try:
         raw = chat(
@@ -137,14 +119,7 @@ def _infer_loop(cfg: Config, template: dict) -> dict:
         return {"loop": False, "exit_condition": "", "loop_back_edges": [], "conditional_edges": [], "rationale": ""}
 
 
-# ================================================================
-#  loop 覆盖
-# ================================================================
 def apply_loop(graph: CompiledGraph, info: dict) -> CompiledGraph:
-    """把 LLM 返回的 loop 信息覆盖到图上。
-
-    conditional edge 取代其 src 的普通出边；loop_back_edges / exit_condition 记录。
-    """
     if not info.get("loop"):
         return graph
 
@@ -159,22 +134,35 @@ def apply_loop(graph: CompiledGraph, info: dict) -> CompiledGraph:
             for b in (ce.get("branches") or [])
         ]
         cond_edges.append(ConditionalEdge(src=src, branches=branches))
-        # 移除 src 的普通出边（改由 conditional edge 路由）
-        graph.edges = [e for e in graph.edges if e.src != src]
 
     for be in info.get("loop_back_edges") or []:
         back_edges.append(GraphEdge(src=str(be.get("from", "")), dst=str(be.get("to", ""))))
 
+    exit_condition = str(info.get("exit_condition", "") or "")
+    loop_sources = {edge.src for edge in back_edges}
+    loop_sources.update(
+        edge.src
+        for edge in cond_edges
+        if any(branch.dst != "__end__" for branch in edge.branches)
+    )
+    for node in graph.nodes:
+        if node.id in loop_sources and node.internal_loop is None:
+            node.internal_loop = task_loop_from_dict(
+                {
+                    "enabled": True,
+                    "max_iterations": 5,
+                    "exit_condition": exit_condition,
+                    "feedback_prompt": "若未满足退出条件，请在当前任务内继续修正并重试。",
+                }
+            )
+
     graph.conditional_edges = cond_edges
     graph.loop_back_edges = back_edges
-    graph.loop = True
-    graph.exit_condition = str(info.get("exit_condition", ""))
+    graph.loop = False
+    graph.exit_condition = exit_condition
     return graph
 
 
-# ================================================================
-#  缓存
-# ================================================================
 def _cache_dir() -> Path:
     d = Path.home() / ".tasker" / "compiled"
     d.mkdir(parents=True, exist_ok=True)
@@ -215,28 +203,32 @@ def _save_cache(key: str, graph: CompiledGraph) -> None:
         pass
 
 
-# ================================================================
-#  入口
-# ================================================================
-def compile_template(cfg: Config, template: dict, *, use_cache: bool | None = None) -> CompiledGraph:
-    """普通模板 → 可执行图（含 loop 结构）。"""
-    nodes = nodes_from_template(template)
+def compile_template(
+    cfg: Config,
+    template: dict,
+    *,
+    use_cache: bool | None = None,
+    loop_info: dict | None = None,
+) -> CompiledGraph:
+    nodes = nodes_from_template(template, default_executor=cfg.dispatch.complex_executor)
     if not nodes:
         return CompiledGraph()
 
     cache = cfg.template_compiler.cache if use_cache is None else use_cache
     key = _cache_key(template)
 
-    if cache:
+    if cache and loop_info is None:
         cached = _load_cache(key)
         if cached is not None and cached.nodes:
             return cached
 
-    if cfg.template_compiler.loop_infer == "off":
+    if loop_info is not None:
+        graph = apply_loop(linear_graph(nodes), loop_info)
+    elif cfg.mock or cfg.template_compiler.loop_infer == "off":
         graph = linear_graph(nodes)
     else:
         graph = apply_loop(linear_graph(nodes), _infer_loop(cfg, template))
 
-    if cache:
+    if cache and loop_info is None:
         _save_cache(key, graph)
     return graph

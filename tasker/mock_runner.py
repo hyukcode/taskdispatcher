@@ -1,6 +1,4 @@
-"""模拟 runner：不真的调用 claude/codex，按时间线伪造完整事件流。
-用于 --mock 演示（无需 API key / CLI 也能跑通全流程）与测试。
-"""
+
 from __future__ import annotations
 
 import threading
@@ -18,7 +16,7 @@ class MockRunner:
         self.workdir = workdir
         self.on_event = on_event
         self.prompt = prompt
-        self.broker = broker  # 非自管理审批（mock 由 ApprovalPolicy 处理），保留统一构造签名
+        self.broker = broker
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._interactions: list[str] = []
@@ -31,7 +29,6 @@ class MockRunner:
     def send_message(self, text: str) -> bool:
         self._interactions.append(text)
         self._emit(Event(kind="user_message", source=self.source, text=text))
-        # 模拟收到注入后继续思考
         self._emit(Event(kind="thinking", source=self.source, text=f"收到用户注入：{text}\n我来据此调整后续动作。"))
         return True
 
@@ -79,7 +76,6 @@ class MockRunner:
             )
             self._emit(Event(kind="thinking", source=self.source, text=f"[{exe}] 已读取上下文，接下来执行核心动作。"))
 
-            # 模拟一次审批请求（演示审批事件流；auto 模式带标记、live 层不展示）
             self._emit(
                 Event(
                     kind="permission_request",

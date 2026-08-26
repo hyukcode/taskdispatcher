@@ -1,6 +1,3 @@
-"""调度器：按依赖分层并发执行 claude/codex，实时流式输出事件，
-并处理用户在 CLI 里随时注入的消息 / 审批决定。
-"""
 from __future__ import annotations
 
 import json
@@ -35,18 +32,15 @@ class Scheduler:
         self._run_id = time.strftime("%Y%m%d-%H%M%S")
         self._raw_dir = self.cfg.workspace_path / self._run_id
 
-    # ---------------- 事件回调 ----------------
     def _on_event(self, run: TaskRun, event: Event) -> None:
         self._raw_append(run, event)
         self.tui.emit(run, event)
 
         if event.kind == "permission_request":
-            # ask_console 模式：暂停其他 runner 的非关键输出，打印醒目横幅
             if self.cfg.approval.mode == "ask_console":
                 self.tui.hold_for_approval()
             with self._active_lock:
                 runner = self._active.get(run.task.id, (None, None))[0]
-            # 使用 can_use_tool 自管理审批的 runner（如 SdkClaudeRunner）不再走 ApprovalPolicy
             if not getattr(runner, "self_handles_approval", False):
                 self.approvals.handle(run, event, emit=self._emit_decision, send_msg=self._sender(run, runner))
         elif event.kind == "permission_result":
@@ -76,7 +70,6 @@ class Scheduler:
         except Exception:
             pass
 
-    # ---------------- 主流程 ----------------
     def run(self) -> list[TaskRun]:
         console.banner("计划")
         print(f"目标: {self.plan.objective}")
@@ -102,26 +95,41 @@ class Scheduler:
         return list(self.runs.values())
 
     def _run_layer(self, layer: list) -> None:
-        threads: list[threading.Thread] = []
+        runnable = []
         for task in layer:
+            blocked = [
+                dep for dep in task.depends_on
+                if dep not in self.runs or self.runs[dep].status != "success"
+            ]
+            if blocked:
+                self._skip_task(task, blocked)
+            else:
+                runnable.append(task)
+
+        threads: list[threading.Thread] = []
+        for task in runnable:
             if self._quit.is_set():
                 break
             th = threading.Thread(target=self._task_worker, args=(task,), daemon=True, name=f"task-{task.id}")
             th.start()
             threads.append(th)
 
-        # 主循环：转发用户输入，直到本层全部结束
         while any(t.is_alive() for t in threads) and not self._quit.is_set():
             self._poll_input()
             time.sleep(0.1)
-        # 清理仍在运行的 runner（如超时/被中断）
-        for task in layer:
+        for task in runnable:
             with self._active_lock:
                 runner, _th = self._active.get(task.id, (None, None))
             if runner is not None and runner.is_alive():
                 runner.stop()
 
-    # ---------------- 单任务 worker ----------------
+    def _skip_task(self, task, blocked: list[str]) -> None:
+        reason = "前置任务未成功：" + ", ".join(blocked)
+        run = TaskRun(task=task, workdir=str(self._task_workdir(task)), status="skipped", error=reason)
+        self.runs[task.id] = run
+        console.status_line("↷", f"跳过 {task.id} [{task.executor}]：{reason}", "yellow")
+        self._on_event(run, Event(kind="error", source="orchestrator", text=reason, data={"skipped": True}))
+
     def _task_worker(self, task) -> None:
         workdir = self._task_workdir(task)
         run = TaskRun(task=task, workdir=str(workdir))
@@ -139,10 +147,9 @@ class Scheduler:
             runner.start()
             deadline = time.time() + self.cfg.timeout_per_task
             while not runner.is_done() and not self._quit.is_set():
-                # 当 runner 等待审批时，不触发超时（用户可能正在决策）
                 pending = getattr(runner, "pending_approval_ids", None)
                 if pending:
-                    deadline = max(deadline, time.time() + 60)  # 每次检查续期 60s
+                    deadline = max(deadline, time.time() + 60)
                 elif time.time() > deadline:
                     run.status = "failed"
                     run.error = f"超时（{self.cfg.timeout_per_task:.0f}s）"
@@ -158,7 +165,7 @@ class Scheduler:
             run.status = "failed"
             run.error = f"找不到可执行文件: {e}"
             self._on_event(run, Event(kind="error", source=task.executor, text=f"启动失败: {e}"))
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             run.status = "failed"
             run.error = str(e)
             self._on_event(run, Event(kind="error", source=task.executor, text=f"运行异常: {e}"))
@@ -173,18 +180,31 @@ class Scheduler:
                 console.status_line("✗", f"{task.id} [{task.executor}] {run.status}: {run.error or '见上方输出'}", "red")
 
     def _task_workdir(self, task) -> Path:
-        """所有 task 共享同一个工作区目录，使前置任务的产物对后续任务直接可见。"""
         self._raw_dir.mkdir(parents=True, exist_ok=True)
         return self._raw_dir
 
     def _prompt_for(self, task) -> str:
-        parts = [f"任务 {task.id}: {task.title}", task.description]
+        parts = [
+            f"任务 {task.id}: {task.title}",
+            task.description,
+            f"共享工作目录：{self._raw_dir}\n请先读取该目录中前置 agent 已产生的代码和文件，再继续本任务；不要重复从零分析整个模板。",
+        ]
+        if getattr(task, "internal_loop", None) is not None and task.internal_loop.enabled:
+            loop = task.internal_loop
+            loop_prompt = (
+                f"本任务包含内部迭代：最多执行 {loop.max_iterations} 轮。"
+                "请在当前任务内部完成检查、修正、重试，不要让编排器重新启动整个任务图。"
+            )
+            if loop.exit_condition:
+                loop_prompt += f"\n内部循环退出条件：{loop.exit_condition}"
+            if loop.feedback_prompt:
+                loop_prompt += f"\n迭代要求：{loop.feedback_prompt}"
+            parts.append(loop_prompt)
         if task.acceptance:
             parts.append(f"完成标准: {task.acceptance}")
         deps = [self.runs[d].output for d in task.depends_on if d in self.runs and self.runs[d].output]
         if deps:
             parts.append("\n依赖任务输出（作为上下文）：\n" + "\n---\n".join(deps)[:8000])
-        # 告知当前任务：前置任务的文件产物就在当前工作目录中（共享工作区）
         dep_ids = [d for d in task.depends_on if d in self.runs and self.runs[d].status == "success"]
         if dep_ids:
             parts.append(
@@ -193,7 +213,6 @@ class Scheduler:
             )
         return "\n\n".join(parts)
 
-    # ---------------- 用户输入路由 ----------------
     def _poll_input(self) -> None:
         if not self.tui:
             return
@@ -265,7 +284,6 @@ class Scheduler:
         if not req_id:
             console.warn("当前没有待处理的审批请求")
             return
-        # 优先路由到自管理审批的 runner（SdkClaudeRunner.can_use_tool 的等待）
         with self._active_lock:
             runners = list(self._active.values())
         for runner, _ in runners:
@@ -287,7 +305,6 @@ class Scheduler:
         return next(reversed(list(self.approvals.pending)), "") if self.approvals.pending else ""
 
     def _finalize_task(self, arg: str) -> None:
-        """:done [<taskid>] —— 手动收尾一个仍在等待的任务（关闭其 stdin 让进程退出）。"""
         with self._active_lock:
             keys = list(self._active.keys())
         target = arg or (keys[0] if keys else "")

@@ -1,10 +1,4 @@
-"""零依赖 LLM 客户端（stdlib urllib）。
 
-- provider=anthropic → Anthropic Messages API
-- provider=openai     → OpenAI 兼容接口（base_url 可指向任意网关/DeepSeek/Ollama）
-
-配合 config.api_key_env 从环境变量取 key。
-"""
 from __future__ import annotations
 
 import json
@@ -64,7 +58,6 @@ def chat(
     temperature: float | None = None,
     max_tokens: int | None = None,
 ) -> str:
-    """发一轮对话，返回纯文本。"""
     body: dict[str, Any] = {
         "model": cfg.model,
         "temperature": cfg.temperature if temperature is None else temperature,

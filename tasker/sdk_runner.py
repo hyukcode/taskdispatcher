@@ -1,15 +1,4 @@
-"""基于官方 claude-agent-sdk 的 Claude 采集器（可选后端，--use-sdk 启用）。
 
-与 ClaudeRunner（手写 stream-json 解析）相比：
-- 事件更结构化：AssistantMessage / SystemMessage / ResultMessage 等类型化消息，
-  block 是 ThinkingBlock / TextBlock / ToolUseBlock / ToolResultBlock。
-- 关键升级：can_use_tool 回调让 headless 下也能收到原本"交互 TTY 才出现"的权限请求，
-  并由编排器程序化批准/拒绝（现方案只能 acceptEdits 放行或 attach 看弹窗）。
-- 中途注入：SDK 无官方"向进行中 turn push 任意 prompt"的 API，
-  这里仍用 ClaudeSDKClient.query() 在持续会话上发新用户消息（底层与 stream-json 同一传输）。
-
-依赖：`pip install claude-agent-sdk`（可选，仅 --use-sdk 时需要）。
-"""
 from __future__ import annotations
 
 import asyncio
@@ -20,21 +9,16 @@ from concurrent import futures
 
 from .approvals import ApprovalBroker
 from .config import Config
-from .models import Event, TaskRun
+from .models import Event, TaskLoop, TaskRun
 
 try:
     import claude_agent_sdk as sdk
-except ImportError:  # 未安装 SDK 时使用 sdk_runner 会给出清晰报错
+except ImportError: 
     sdk = None
 
 
 class SdkClaudeRunner:
-    """与 ClaudeRunner 相同的对外接口（start/is_done/finalize/stop/send_message/is_alive），
-    额外暴露 approval_respond/pending_approval_ids 供调度器把 :allow/:deny 送达 can_use_tool。
-    """
-
     source = "claude"
-    # 审批请求由本 runner 的 can_use_tool 自行处理，调度器的 ApprovalPolicy 不要再插手
     self_handles_approval = True
 
     def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
@@ -54,8 +38,15 @@ class SdkClaudeRunner:
         self._injection_ts: float | None = None
         self._last_event_ts: float = time.time()
         self._settle = float(getattr(cfg.claude, "completion_idle", 5.0))
+        self._internal_loop: TaskLoop | None = None
+        self._loop_iteration = 0
+        self._next_loop_prompt = ""
 
-    # ---------- 生命周期 ----------
+    def set_internal_loop(self, loop: TaskLoop | None) -> None:
+        self._internal_loop = loop if loop and loop.enabled else None
+        if self._internal_loop is not None:
+            self._internal_loop.max_iterations = max(1, int(self._internal_loop.max_iterations))
+
     def start(self) -> None:
         if sdk is None:
             raise RuntimeError("未安装 claude-agent-sdk：请先 `pip install claude-agent-sdk`（仅 --use-sdk 需要）")
@@ -66,7 +57,7 @@ class SdkClaudeRunner:
     def _amain(self) -> None:
         try:
             asyncio.run(self._arun())
-        except Exception as e:  # noqa: BLE001 —— 事件泵线程永不因单点异常退出
+        except Exception as e:
             self._emit(Event(kind="error", source=self.source, text=f"SDK 事件泵异常: {e}"))
         finally:
             self.run.ended_at = time.time()
@@ -77,18 +68,21 @@ class SdkClaudeRunner:
         async with sdk.ClaudeSDKClient(options=opts) as client:
             self._client = client
             await client.query(self._sys_prompt())
-            async for msg in client.receive_response():
-                if self._stop.is_set():
+            while not self._stop.is_set():
+                continue_loop = False
+                async for msg in client.receive_response():
+                    if self._stop.is_set():
+                        break
+                    try:
+                        continue_loop = self._handle(msg) or continue_loop
+                    except Exception as e:
+                        self._emit(Event(kind="error", source=self.source, text=f"事件处理失败: {e}"))
+                if not continue_loop:
                     break
-                try:
-                    self._handle(msg)
-                except Exception as e:  # noqa: BLE001
-                    self._emit(Event(kind="error", source=self.source, text=f"事件处理失败: {e}"))
+                await client.query(self._next_loop_prompt)
 
     def _build_options(self):
         c = self.cfg.claude
-        # can_use_tool 只在 permission 决策为 "ask" 时触发；acceptEdits 下 Bash 等是 auto-deny 不会回调。
-        # 因此 SDK 后端把默认的 acceptEdits 翻译成 default：需要权限的工具都走 can_use_tool 由审批策略决定。
         mode = c.permission_mode or "default"
         if mode == "acceptEdits":
             mode = "default"
@@ -103,10 +97,8 @@ class SdkClaudeRunner:
             "permission_mode": mode,
             "can_use_tool": self._can_use_tool,
             "cwd": self.workdir,
-            # SDK 的 extra_args 是 dict：key 不含前导 --（SDK 会自己加），value None 表示纯开关
             "extra_args": {"verbose": None},
         }
-        # 只在非空时传：SDK 对显式 None 的 allowed_tools 有 bug（_warn_if_can_use_tool_shadowed 会 dict.fromkeys(None)）
         if c.model:
             kwargs["model"] = c.model
         if c.allowed_tools:
@@ -116,11 +108,19 @@ class SdkClaudeRunner:
         return sdk.ClaudeAgentOptions(**kwargs)
 
     def _sys_prompt(self) -> str:
-        return (
+        prompt = (
             "你是 tasker 多智能体编排中的一个子任务 worker。当前工作目录即任务目录。\n"
             "协作提示：编排器可能在运行中向你注入后续要求（用户中途修改/追问），收到后请按新要求调整再继续。\n\n"
             + self.prompt
         )
+        if self._internal_loop is not None:
+            prompt += (
+                "\n\n这是一个任务内部迭代。请检查实际工作区和完成标准：满足时输出 JSON "
+                '{"status":"passed","feedback":"..."}；不满足时先修正问题，再输出 '
+                '{"status":"needs_iteration","feedback":"具体还需要做什么"}。'
+                f"最多执行 {self._internal_loop.max_iterations} 轮，不要要求编排器重跑整张任务图。"
+            )
+        return prompt
 
     def is_alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
@@ -152,7 +152,6 @@ class SdkClaudeRunner:
             except Exception:
                 pass
 
-    # ---------- 中途注入 ----------
     def send_message(self, text: str) -> bool:
         if not self._client or not self._loop or self._stop.is_set():
             return False
@@ -165,7 +164,6 @@ class SdkClaudeRunner:
         except Exception:  # noqa: BLE001
             return False
 
-    # ---------- can_use_tool：headless 程序化审批 ----------
     async def _can_use_tool(self, tool_name: str, input_data: dict, context) -> sdk.PermissionResult:
         tool_use_id = (context.tool_use_id if context is not None else None) or str(time.time())
         mode = self.cfg.approval.mode
@@ -185,7 +183,6 @@ class SdkClaudeRunner:
             self._permission_result(req, False, "log 模式：仅记录，默认拒绝")
             return sdk.PermissionResultDeny(message="log 模式拒绝")
 
-        # ask_console：在 CLI 展示审批请求，阻塞等待用户 :allow/:deny
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
 
@@ -219,17 +216,14 @@ class SdkClaudeRunner:
         return self.broker.pending_ids
 
     def approval_respond(self, req_id: str, allowed: bool) -> bool:
-        """调度器 :allow/:deny 送达：解析阻塞在 can_use_tool 里的等待。"""
         return self.broker.resolve(req_id, allowed=allowed)
 
-    # ---------- 事件泵 ----------
     def _emit(self, event: Event) -> None:
         self._last_event_ts = time.time()
         self.run.events.append(event)
         self.on_event(self.run, event)
 
-    def _handle(self, msg) -> None:
-        # SDK 消息没有 .type 字段，用 isinstance 分派
+    def _handle(self, msg) -> bool:
         if isinstance(msg, sdk.SystemMessage):
             self._handle_system(msg)
         elif isinstance(msg, sdk.AssistantMessage):
@@ -244,11 +238,12 @@ class SdkClaudeRunner:
                 for block in content or []:
                     self._handle_block(block)
         elif isinstance(msg, sdk.ResultMessage):
-            self._handle_result(msg)
+            return self._handle_result(msg)
         elif isinstance(msg, sdk.StreamEvent):
-            pass  # 流式增量事件，prototype 不展开
+            pass 
         else:
             self._emit(Event(kind="raw", source=self.source, text=str(msg)[:2000]))
+        return False
 
     def _handle_system(self, msg) -> None:
         sub = msg.subtype
@@ -260,11 +255,11 @@ class SdkClaudeRunner:
                     kind="system",
                     source=self.source,
                     text=f"会话初始化（SDK） cwd={data.get('cwd', '')}",
-                    data={"session_id": data.get("session_id")},
+                    data={"session_id": data.get("session_id"), "display": True},
                 )
             )
         elif sub == "thinking_tokens":
-            pass  # token 计数噪音，忽略
+            pass
         elif sub in ("task_started", "task_progress", "task_notification"):
             self._emit(
                 Event(
@@ -275,7 +270,6 @@ class SdkClaudeRunner:
                 )
             )
         elif sub == "permission_denied":
-            # 未走 can_use_tool 的自动拒绝（如 acceptEdits 直拒），作为审批结果呈现
             self._emit(Event(kind="permission_result", source=self.source, text="权限被拒", data={"allowed": False, "detail": data}))
         else:
             self._emit(Event(kind="system", source=self.source, text=f"{sub} {_compact(data, 160)}", data=data))
@@ -313,11 +307,50 @@ class SdkClaudeRunner:
                 )
             )
 
-    def _handle_result(self, msg) -> None:
+    def _handle_result(self, msg) -> bool:
         self._result_ts = time.time()
         self.run.output = str(msg.result or "")
-        self.run.exit_code = 0 if not msg.is_error else 1
         self.run.cost_usd = float(msg.total_cost_usd or 0.0)
+        usage = _usage_dict(getattr(msg, "usage", None))
+        if usage:
+            usage.setdefault("cost_usd", self.run.cost_usd)
+            self._emit(
+                Event(
+                    kind="usage",
+                    source=self.source,
+                    text=_compact(usage, 180),
+                    data=usage,
+                )
+            )
+
+        decision = _loop_decision(self.run.output) if self._internal_loop and not msg.is_error else None
+        if (
+            decision
+            and decision.get("status") == "needs_iteration"
+            and self._internal_loop is not None
+            and self._loop_iteration + 1 < self._internal_loop.max_iterations
+        ):
+            self._loop_iteration += 1
+            feedback = str(decision.get("feedback") or "请重新检查任务结果并修正未满足的条件。")
+            self.run.status = "running"
+            self.run.exit_code = None
+            self._result_ts = None
+            self._next_loop_prompt = (
+                "继续当前任务的内部迭代。请在同一个工作区中根据上一轮反馈检查、修正并验证。\n"
+                f"上一轮反馈：{feedback}\n"
+                "完成后再次输出 status=passed 或 status=needs_iteration，并给出 feedback。"
+            )
+            self._emit(
+                Event(
+                    kind="interaction",
+                    source=self.source,
+                    text=f"任务内部 loop：第 {self._loop_iteration} 轮未满足，继续同一 Claude SDK 会话",
+                    data={"internal_loop": True, "iteration": self._loop_iteration, "feedback": feedback},
+                )
+            )
+            return True
+
+        self.run.exit_code = 0 if not msg.is_error else 1
         for d in msg.permission_denials or []:
             text = d.get("message", "") if isinstance(d, dict) else str(d)
             self._emit(Event(kind="permission_result", source=self.source, text=str(text), data={"allowed": False, "detail": d}))
@@ -330,15 +363,62 @@ class SdkClaudeRunner:
                     "stop_reason": msg.stop_reason,
                     "terminal_reason": msg.terminal_reason,
                     "cost_usd": self.run.cost_usd,
+                    "usage": usage,
                     "permission_denials": len(msg.permission_denials or []),
                 },
             )
         )
+        return False
 
 
 def _compact(obj, width: int) -> str:
     try:
         s = json.dumps(obj, ensure_ascii=False, default=str)
-    except Exception:  # noqa: BLE001
+    except Exception:
         s = str(obj)
     return s if len(s) <= width else s[: width - 1] + "…"
+
+
+def _usage_dict(value) -> dict:
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    for method in ("model_dump", "dict"):
+        fn = getattr(value, method, None)
+        if callable(fn):
+            try:
+                data = fn()
+            except Exception:
+                continue
+            if isinstance(data, dict):
+                return data
+    try:
+        data = vars(value)
+    except TypeError:
+        return {}
+    return dict(data) if isinstance(data, dict) else {}
+
+
+def _loop_decision(output: str) -> dict | None:
+    text = (output or "").strip()
+    if not text:
+        return None
+    candidates = [text]
+    if "```" in text:
+        candidates.extend(part.strip() for part in text.split("```") if part.strip())
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except json.JSONDecodeError:
+            decoder = json.JSONDecoder()
+            start = candidate.find("{")
+            if start < 0:
+                continue
+            try:
+                value, _ = decoder.raw_decode(candidate[start:])
+            except json.JSONDecodeError:
+                continue
+        if isinstance(value, dict) and value.get("status") in {"passed", "needs_iteration"}:
+            return value
+    return None

@@ -1,10 +1,8 @@
-"""终端彩色输出助手（跨平台，自动启用 Windows VT 序列）。"""
 from __future__ import annotations
 
 import os
 import sys
 
-# 强制 stdout/stderr 使用 UTF-8，避免中文 + emoji 在 GBK 等窄编码终端上抛 UnicodeEncodeError。
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
@@ -57,11 +55,10 @@ def paint(text: str, *styles: str) -> str:
     return f"{codes}{text}{_C['reset']}"
 
 
-_write_hook = None  # callable(text) → 输出到 TUI；由 LiveTui 注册
+_write_hook = None
 
 
 def _out(text: str, stream=None, **kw) -> None:
-    """统一出口：flush，保证管道/重定向下实时可见。"""
     if _write_hook is not None and stream is None:
         _write_hook(text)
         return

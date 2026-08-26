@@ -1,16 +1,4 @@
-"""会话持久化：把一次目标任务的执行状态存到 ~/.tasker/sessions/<id>/。
 
-目录结构：
-  session.json   —— Session 元数据 + 累计 state + refs + history
-  plan.json      —— 当前(或历史) graph 计划快照
-  events/<task>.jsonl —— 各 runner 的原始事件
-
-共享工作目录固定为 ~/.tasker/workspace（和 config.json 一样在 ~/.tasker/ 下），
-文件产物持久化、跨迭代/跨 resume 可见，不随 session 目录变化。
-
-resume 引子：refs 里的 claude_session_id / codex_thread_id 让 code agent 可续聊，
-不再从头跑。
-"""
 
 from __future__ import annotations
 
@@ -24,7 +12,6 @@ from .models import CompiledGraph, Session, graph_from_dict, graph_to_dict
 
 
 def new_session_id() -> str:
-    """生成会话 id：时间戳 + 短随机。"""
     return time.strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(3)
 
 
@@ -61,20 +48,19 @@ def _session_from_dict(d: dict) -> Session:
 
 
 class SessionStore:
-    """Session 的读写。"""
 
     def __init__(self, cfg: SessionConfig | None = None, base_dir: str | Path | None = None):
         self.cfg = cfg or SessionConfig()
         self.base = Path(base_dir) if base_dir else self.cfg.path
         self.base.mkdir(parents=True, exist_ok=True)
 
-    # ---------- 路径 ----------
     def dir_for(self, session_id: str) -> Path:
         return self.base / session_id
 
-    def workspace(self) -> Path:
-        """共享工作目录：固定到 ~/.tasker/workspace（和 config.json 一样用户级固定），确保存在。"""
+    def workspace(self, session_id: str | None = None) -> Path:
         d = self.cfg.workspace_path
+        if session_id:
+            d = d / session_id
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -83,9 +69,7 @@ class SessionStore:
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{task_id}.events.jsonl"
 
-    # ---------- 写入 ----------
     def save(self, session: Session, plan: CompiledGraph | None = None) -> Path:
-        """保存 session（可选同时保存 graph 快照）。"""
         d = self.dir_for(session.session_id)
         d.mkdir(parents=True, exist_ok=True)
         session.updated_at = _now()
@@ -101,7 +85,6 @@ class SessionStore:
         return d
 
     def append_event(self, session_id: str, task_id: str, event: dict) -> None:
-        """追加一条事件到 events/<task>.jsonl（幂等，容错）。"""
         try:
             f = self.events_file(session_id, task_id)
             with open(f, "a", encoding="utf-8") as fh:
@@ -109,7 +92,6 @@ class SessionStore:
         except Exception:
             pass
 
-    # ---------- 读取 ----------
     def load(self, session_id: str) -> Session | None:
         f = self.dir_for(session_id) / "session.json"
         if not f.exists():
@@ -129,7 +111,6 @@ class SessionStore:
             return None
 
     def list(self) -> list[dict]:
-        """列出所有会话摘要（按 session_id 排序）。"""
         out: list[dict] = []
         for d in sorted(self.base.iterdir()):
             if not d.is_dir():

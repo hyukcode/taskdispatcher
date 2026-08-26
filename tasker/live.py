@@ -1,16 +1,4 @@
-"""实时终端：精简输出 + 输入行锚定底部。
 
-输出精简策略：
-- 思维链：1 行摘要（max 120 字），dim 色
-- 文本输出：最多 3 行，超出折叠
-- 工具调用：1 行，输入参数截断到 100 字
-- 工具结果：最多 3 行，超出折叠
-- 审批请求：醒目横幅，且在此期间暂停其他 runner 的非关键输出
-
-输入锚定：
-- 使用逐字符读取（替代 readline），在每次输出前后清除/恢复输入行
-- 用户输入始终可见，不被事件流刷屏
-"""
 
 from __future__ import annotations
 
@@ -42,10 +30,22 @@ HELP = """\
   :quit / quit / exit  终止所有运行中的 agent 并退出程序（或 Ctrl+C）
 """
 
-# minimal 显示只放行这些事件（其余 thinking/tool_use/tool_result/text/system 不打印）
-_MINIMAL_KINDS = frozenset(
-    {"result", "permission_request", "permission_result", "review_request", "review_result", "error", "user_message"}
+_CORE_KINDS = frozenset(
+    {
+        "user_message",
+        "text",
+        "tool_use",
+        "tool_result",
+        "permission_request",
+        "permission_result",
+        "review_request",
+        "review_result",
+        "interaction",
+        "error",
+        "result",
+    }
 )
+_DETAIL_KINDS = _CORE_KINDS | frozenset({"thinking", "system", "usage"})
 
 APPROVAL_BANNER = """\
 ╔══════════════════════════════════════════════════════════╗
@@ -66,7 +66,6 @@ def parse_input_line(raw: str) -> dict:
         cmd = (parts[0] or "").lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
         return {"type": "cmd", "cmd": cmd, "arg": arg}
-    # 退出词兼容：裸 quit/exit/q 或 /quit /exit /q 在运行中也当作退出指令（不再误发成消息）
     if s.lower() in ("quit", "q", "exit", "/quit", "/q", "/exit"):
         return {"type": "cmd", "cmd": "quit", "arg": ""}
     if s.startswith("@"):
@@ -77,26 +76,16 @@ def parse_input_line(raw: str) -> dict:
     return {"type": "msg", "target": "all", "text": s}
 
 
-# ================================================================
-#  平台适配：逐字符输入
-# ================================================================
-_raw_buf = b""  # Unix: 多字节 UTF-8 累积缓冲区
+_raw_buf = b""
 
 
 def _raw_char() -> str:
-    """读取单个 Unicode 字符（阻塞）。跨平台实现。
-
-    Windows: msvcrt.getwch() 直接返回宽字符。
-    macOS/Linux: os.read(fd, 1) 逐字节读，累积到 _raw_buf 后解码为完整字符。
-                 方向键等 ESC 序列被吞掉。
-    """
     if sys.platform == "win32":
         import msvcrt
         try:
             ch = msvcrt.getwch()
         except UnicodeDecodeError:
             return ""
-        # 特殊键前缀 → 吞掉后续扫描码
         if ch in ("\x00", "\xe0"):
             try:
                 msvcrt.getwch()
@@ -109,7 +98,6 @@ def _raw_char() -> str:
 
 
 def _raw_char_unix() -> str:
-    """Unix 逐字节读取 + UTF-8 解码 + ESC 序列吞掉。"""
     global _raw_buf
     import os
     fd = sys.stdin.fileno()
@@ -118,21 +106,20 @@ def _raw_char_unix() -> str:
     except Exception:
         return ""
     if not b:
-        return ""  # EOF
+        return ""
     _raw_buf += b
     try:
         ch = _raw_buf.decode("utf-8")
         _raw_buf = b""
     except UnicodeDecodeError:
-        return ""  # 多字节字符尚未完整
-    if ch == "\x1b":  # ESC 序列（方向键等）
+        return ""
+    if ch == "\x1b":
         _drain_esc_seq()
         return ""
     return ch
 
 
 def _drain_esc_seq() -> None:
-    """吞掉 ESC 后续字节，避免方向键等输出乱码。"""
     import os
     import select
     fd = sys.stdin.fileno()
@@ -144,9 +131,8 @@ def _drain_esc_seq() -> None:
 
 
 def _raw_start() -> None:
-    """进入原始模式（macOS/Linux only）。"""
     global _raw_buf
-    _raw_buf = b""  # 清空累积的字节缓冲
+    _raw_buf = b""
     if sys.platform == "win32":
         return
     if not sys.stdin.isatty():
@@ -156,16 +142,15 @@ def _raw_start() -> None:
     import tty
     fd = sys.stdin.fileno()
     try:
-        _raw_start._saved = termios.tcgetattr(fd)  # type: ignore[attr-defined]
+        _raw_start._saved = termios.tcgetattr(fd)
     except Exception:
-        _raw_start._saved = None  # type: ignore[attr-defined]
-    if _raw_start._saved:  # type: ignore[attr-defined]
+        _raw_start._saved = None 
+    if _raw_start._saved: 
         tty.setraw(fd)
         atexit.register(_raw_stop)
 
 
 def _raw_stop() -> None:
-    """恢复终端设置（Unix only）。"""
     if sys.platform == "win32":
         return
     import termios
@@ -177,9 +162,6 @@ def _raw_stop() -> None:
             pass
 
 
-# ================================================================
-#  LiveTui
-# ================================================================
 class LiveTui:
     """精简实时输出 + 输入行锚定底部 + 审批抑制。"""
 
@@ -193,30 +175,23 @@ class LiveTui:
         self._input_thread: threading.Thread | None = None
         self._started = False
         self._paused = False
-        # 审批期间抑制其他 runner 的非关键输出
         self._hold = threading.Event()
         self._hold.clear()
-        # 统计
         self._event_counts: dict[str, int] = {}
-        # 输入缓冲（逐字符模式）
         self._input_buf = ""
         self._prompt = "> "
 
-    # ---------- 输入 ----------
     def start(self) -> None:
         if not self.input_enabled or self._started:
             return
         self._started = True
         _raw_start()
-        # 注册 console 输出钩子，让所有 console.* / print 也走输入行恢复
         console._write_hook = self._console_hook
-        # 打印启动提示（作为普通输出，不干扰输入行）
         self.print_raw(console.paint("▶ 输入 :help 查看指令。审批时用 :allow / :deny 决定。", "dim"))
         self._input_thread = threading.Thread(target=self._read_loop, daemon=True, name="tui-input")
         self._input_thread.start()
 
     def _console_hook(self, text: str) -> None:
-        """console._out → 统一经 print_raw 输出，避免绕过输入行恢复。"""
         self.print_raw(text)
 
     def _read_loop(self) -> None:
@@ -231,15 +206,15 @@ class LiveTui:
             with self._print_lock:
                 if ch in ("\r", "\n"):
                     self._handle_enter()
-                elif ch in ("\x08", "\x7f"):  # Backspace
+                elif ch in ("\x08", "\x7f"):
                     self._handle_backspace()
-                elif ch == "\x03":  # Ctrl+C
+                elif ch == "\x03":
                     self._input_buf = ""
                     self._redraw()
                     self._cmds.put({"type": "cmd", "cmd": "quit", "arg": ""})
                     self._stop.set()
                     break
-                elif ch in ("\x04", "\x1a"):  # Ctrl+D (EOF) / Ctrl+Z (Windows EOF)
+                elif ch in ("\x04", "\x1a"):
                     self._cmds.put({"type": "cmd", "cmd": "quit", "arg": ""})
                     self._input_buf = ""
                     self._redraw()
@@ -250,12 +225,9 @@ class LiveTui:
                     sys.stdout.flush()
 
     def _handle_enter(self) -> None:
-        """Enter 键：提交当前缓冲。"""
         line = self._input_buf
         self._input_buf = ""
-        # 清除当前行
         sys.stdout.write("\r\033[K")
-        # 回显提交的内容
         sys.stdout.write(f"{self._prompt}{line}\n")
         sys.stdout.flush()
         if line.strip():
@@ -266,7 +238,6 @@ class LiveTui:
         self._redraw()
 
     def _handle_backspace(self) -> None:
-        """退格键。"""
         if self._input_buf:
             self._input_buf = self._input_buf[:-1]
             sys.stdout.write("\b \b")
@@ -283,7 +254,6 @@ class LiveTui:
 
     # ---------- 审批抑制 ----------
     def hold_for_approval(self) -> None:
-        """审批出现：暂停其他 runner 的非关键输出，并打印醒目横幅。"""
         if not self._hold.is_set():
             self._hold.set()
             self.print_raw("")
@@ -291,7 +261,6 @@ class LiveTui:
             self.print_raw("")
 
     def release_hold(self) -> None:
-        """审批结束：恢复输出。"""
         self._hold.clear()
 
     @property
@@ -304,35 +273,32 @@ class LiveTui:
             self._write_locked(text)
 
     def _write_locked(self, text: str) -> None:
-        """输出一行文本（调用方须已持有 _print_lock）。
-
-        步骤：清除输入行 → 打印输出 → 恢复输入行。
-        """
-        # 清除当前输入行
         sys.stdout.write("\r\033[K")
-        # 输出内容
         sys.stdout.write(text + "\n")
-        # 恢复输入行
         self._redraw()
 
     def _redraw(self) -> None:
-        """重绘输入提示行。"""
         sys.stdout.write(f"\r{self._prompt}{self._input_buf}")
         sys.stdout.flush()
 
     def emit(self, run: TaskRun, event: Event, source_tag: str = "") -> None:
-        """精简输出。"""
         tag = source_tag or event.source
         kind = event.kind
 
-        # 审批期间：只放行审批相关事件和错误
         if self._hold.is_set() and kind not in (
             "permission_request", "permission_result", "review_request", "review_result", "error", "result", "user_message"
         ):
             return
 
-        # minimal 显示：只放行关键事件（result / 审批 / 审查 / 错误），其余不打印
-        if self.display_level == "minimal" and kind not in _MINIMAL_KINDS:
+        if self.display_level == "debug":
+            visible = True
+        elif self.display_level == "verbose":
+            visible = kind in _DETAIL_KINDS
+        else:
+            visible = kind in _CORE_KINDS or (
+                kind == "system" and bool(event.data.get("display", False))
+            )
+        if not visible:
             return
 
         with self._print_lock:
@@ -362,12 +328,15 @@ class LiveTui:
                 self._write_locked(console.paint(f"[{tag}] 🏁 {_truncate(event.text, 200)}", "green"))
             elif kind == "interaction":
                 self._write_locked(console.paint(f"[{tag}] 🔁 {event.text}", "magenta"))
+            elif kind == "usage":
+                self._emit_usage_locked(tag, event)
             elif kind == "system":
                 self._write_locked(console.paint(f"[{tag}] ⚙ {event.text}", "dim"))
+            elif kind == "raw":
+                self._write_locked(console.paint(f"[{tag}] 🧪 {event.text[:120]}", "dim"))
             else:
                 self._write_locked(f"[{tag}] [{kind}] {event.text[:120]}")
 
-    # ---- 各事件精简输出（调用方已持有 _print_lock） ----
     def _emit_thinking_locked(self, tag: str, event: Event) -> None:
         if self.think_level == "off":
             return
@@ -391,6 +360,16 @@ class LiveTui:
         line = f"[{tag}] {icon} {text}"
         self._write_locked(console.paint(line, "red") if is_err else line)
 
+    def _emit_usage_locked(self, tag: str, event: Event) -> None:
+        data = event.data or {}
+        parts = []
+        for key, label in (("input_tokens", "in"), ("output_tokens", "out"), ("total_tokens", "total"), ("cost_usd", "cost")):
+            value = data.get(key)
+            if value is not None:
+                parts.append(f"{label}={value}")
+        text = event.text or " ".join(parts) or "用量已更新"
+        self._write_locked(console.paint(f"[{tag}] 📊 {_truncate(text, 180)}", "dim"))
+
     def _emit_text_locked(self, tag: str, event: Event) -> None:
         lines = (event.text or "").strip().splitlines()
         if not lines:
@@ -403,7 +382,7 @@ class LiveTui:
 
     def _emit_permission_request_locked(self, tag: str, event: Event) -> None:
         if event.data.get("auto"):
-            return  # 自动通过的审批不展示
+            return
         tool = event.data.get("tool", "?")
         inp = event.data.get("input", {})
         req_id = event.data.get("id", "")[:16]
@@ -412,7 +391,7 @@ class LiveTui:
 
     def _emit_permission_result_locked(self, tag: str, event: Event) -> None:
         if event.data.get("auto"):
-            return  # 自动通过的审批不展示
+            return
         allowed = event.data.get("allowed")
         if allowed is True:
             self._write_locked(console.paint(f"[{tag}] ✅ 已批准", "green"))
@@ -438,7 +417,6 @@ class LiveTui:
         else:
             self._write_locked(f"[{tag}] ❔ 审查结果 {_truncate(event.text, 160)}")
 
-    # ---------- 控制 ----------
     def pause(self) -> None:
         self._paused = True
 
@@ -447,24 +425,18 @@ class LiveTui:
 
     def stop(self) -> None:
         self._stop.set()
-        # 恢复终端设置
         _raw_stop()
-        # 注销 console 钩子
         console._write_hook = None
         if self._input_thread and self._input_thread.is_alive():
             self._input_thread.join(timeout=1.0)
 
 
-# ================================================================
-#  辅助
-# ================================================================
 def _truncate(text: str, width: int) -> str:
     s = text.strip().replace("\n", " ")
     return s if len(s) <= width else s[:width - 1] + "…"
 
 
 def _oneliner(text: str) -> str:
-    """取首行（或前 80 字）。"""
     t = text.strip()
     if not t:
         return ""
@@ -473,13 +445,11 @@ def _oneliner(text: str) -> str:
 
 
 def _fmt_tool_input_compact(inp) -> str:
-    """紧凑工具输入摘要（单行，max 100 字）。"""
     import json
 
     if isinstance(inp, str):
         return _truncate(inp, 100)
     if isinstance(inp, dict):
-        # 摘取最关键的 key
         keys = []
         for k in ("command", "file_path", "description", "path", "query", "url", "message", "content", "text"):
             if k in inp:
@@ -501,7 +471,6 @@ def _fmt_tool_input_compact(inp) -> str:
 
 
 def _fmt_tool_input(inp) -> str:
-    """完整工具输入（用于审批请求详情，保留兼容）。"""
     import json
 
     if isinstance(inp, str):
