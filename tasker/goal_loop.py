@@ -89,7 +89,7 @@ class GoalLoop:
         self.store = store
         self.emit = emit or (lambda run, event: console.event_line(event.summary(), source=event.source))
         self.planner = planner or self._default_planner
-        self.evaluator = evaluator or (self._mock_evaluator if cfg.mock else self._code_agent_evaluator)
+        self.evaluator = evaluator or self._code_agent_evaluator
         self.judge = judge
         self.template = template
         self.session: Session | None = None
@@ -176,8 +176,6 @@ class GoalLoop:
         ctx = f"（上一轮未达成，需改进：{state.get('feedback')}）" if state.get("feedback") else ""
         prompt = goal + ctx
         emit = lambda e: self._emit(None, e)  # noqa: E731
-        if self.cfg.mock:
-            return plan_with_rules(prompt, template=self.template)
         try:
             return plan_with_llm(prompt, self.cfg, emit=emit, template=self.template)
         except LLMError as e:
@@ -219,9 +217,6 @@ class GoalLoop:
         for r in runs:
             parts.append(f"[{r.task.id} {r.task.executor}] {r.status}: {r.output[:1500]}")
         return "\n".join(parts)
-
-    def _mock_evaluator(self, goal: str, state: dict, summary: str, session: Session) -> dict:
-        return {"achieved": True, "feedback": "（mock 模式）判定达成"}
 
     def _code_agent_evaluator(self, goal: str, state: dict, summary: str, session: Session) -> dict:
         node = SubTask(

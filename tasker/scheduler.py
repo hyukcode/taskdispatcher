@@ -7,7 +7,6 @@ import time
 from pathlib import Path
 
 from . import console
-from .approvals import ApprovalPolicy
 from .codex_app_server_runner import CodexAppServerRunner
 from .config import Config
 from .live import HELP, LiveTui
@@ -24,7 +23,6 @@ class Scheduler:
         self.plan = plan
         self.tui = tui or LiveTui()
         self.runs: dict[str, TaskRun] = {}
-        self.approvals = ApprovalPolicy(cfg.approval)
         self._quit = threading.Event()
         self._active: dict[str, tuple] = {}  # task_id -> (runner, thread)
         self._active_lock = threading.Lock()
@@ -38,25 +36,9 @@ class Scheduler:
         if event.kind == "permission_request":
             if self.cfg.approval.mode == "ask_console":
                 self.tui.hold_for_approval()
-            with self._active_lock:
-                runner = self._active.get(run.task.id, (None, None))[0]
-            if not getattr(runner, "self_handles_approval", False):
-                self.approvals.handle(run, event, emit=self._emit_decision, send_msg=self._sender(run, runner))
         elif event.kind == "permission_result":
             if self.tui.is_held:
                 self.tui.release_hold()
-
-    def _emit_decision(self, run: TaskRun, event: Event) -> None:
-        self._raw_append(run, event)
-        self.tui.emit(run, event)
-
-    def _sender(self, run: TaskRun, runner):
-        def send(text: str):
-            if runner is not None:
-                return runner.send_message(text)
-            return False
-
-        return send
 
     def _raw_append(self, run: TaskRun, event: Event) -> None:
         try:
@@ -289,11 +271,7 @@ class Scheduler:
             if hasattr(runner, "approval_respond") and runner.approval_respond(req_id, allowed):
                 self.tui.release_hold()
                 return
-        ok = self.approvals.decide(req_id, allowed, emit=self._emit_decision, send_msg=self._last_sender())
-        if ok:
-            self.tui.release_hold()
-        if not ok:
-            console.warn(f"审批请求 {req_id} 已不在待处理列表（可能已由策略自动处理）")
+        console.warn(f"审批请求 {req_id} 未找到对应的 SDK/App Server runner")
 
     def _find_pending_approval_id(self) -> str:
         with self._active_lock:
@@ -301,8 +279,6 @@ class Scheduler:
         for runner, _ in runners:
             if hasattr(runner, "pending_approval_ids") and runner.pending_approval_ids:
                 return list(runner.pending_approval_ids)[-1]
-        return next(reversed(list(self.approvals.pending)), "") if self.approvals.pending else ""
-
     def _finalize_task(self, arg: str) -> None:
         with self._active_lock:
             keys = list(self._active.keys())
@@ -318,15 +294,6 @@ class Scheduler:
         if hasattr(runner, "finalize"):
             console.info(f"手动收尾 {target} …")
             runner.finalize()
-
-    def _last_sender(self):
-        with self._active_lock:
-            items = list(self._active.items())
-        for tid, (runner, _) in items:
-            run = self.runs.get(tid)
-            if run:
-                return self._sender(run, runner)
-        return None
 
     def _print_status(self) -> None:
         console.banner("任务状态")

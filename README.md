@@ -16,7 +16,7 @@
 | 🛡️ 审批请求 | 权限拒绝、`permission_request`/`permission_result` 实时浮现；`approval` 策略可 auto/log/ask |
 | 💬 中途修改 | 运行中 `@claude/@codex/@all <消息>` 注入当前 SDK / App Server 会话 |
 | 🎯 依赖编排 | LLM 拆出依赖图 → 分层并发；上游输出自动作为下游上下文 |
-| 🧪 零依赖 | 纯 Python 标准库；`--mock` 无需任何 CLI/API key 即可演示全流程 |
+| 🧭 规则拆分 | `--plan-rules` 可跳过任务拆分 LLM，直接生成执行计划 |
 | 📋 报告 | 可选 `--report` 落一份完整 Markdown 轨迹 |
 
 ---
@@ -51,9 +51,6 @@ python -m tasker run "写一个 Python CLI 工具，带子命令，并补上单�
 
 # 规则拆分（不用 LLM 也能跑，适合快速试）
 python -m tasker run "实现一个斐波那契脚本" --plan-rules
-
-# 无任何 CLI / API key 的纯演示
-python -m tasker run "写一个 python 脚本并测试" --mock --think head
 
 # 只打印计划
 python -m tasker plan "重构这个项目" --json
@@ -117,7 +114,7 @@ tasker/
   codex_app_server_runner.py  Codex App Server 事件采集 + thread/turn 注入
   live.py          LiveTui：实时打印 + 后台输入线程 + 指令解析
   approvals.py     审批策略（auto / log / ask_console）
-  llm.py / config.py / spawn.py / models.py / console.py / report.py / mock_runner.py
+  llm.py / config.py / spawn.py / models.py / console.py / report.py
 ```
 
 ---
@@ -154,7 +151,7 @@ tasker/
 ## Codex App Server 的说明
 
 - Codex 任务使用持久 thread；`@codex` 注入通过 `turn/steer` 或新的 `turn/start` 进入当前任务。
-- 未安装或版本不支持 App Server 时，含 Codex 的任务会失败并给出错误；可用 `--mock` 或 `--plan-rules` 先体验。
+- 未安装或版本不支持 App Server 时，含 Codex 的任务会失败并给出错误；可用 `--plan-rules` 跳过拆分 LLM 先体验。
 
 ---
 

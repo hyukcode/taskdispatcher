@@ -224,7 +224,7 @@ def compile_template(
 
     if loop_info is not None:
         graph = apply_loop(linear_graph(nodes), loop_info)
-    elif cfg.mock or cfg.template_compiler.loop_infer == "off":
+    elif cfg.template_compiler.loop_infer == "off":
         graph = linear_graph(nodes)
     else:
         graph = apply_loop(linear_graph(nodes), _infer_loop(cfg, template))

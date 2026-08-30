@@ -15,12 +15,6 @@ from .models import subtask_to_dict
 from .planner import plan_with_llm, plan_with_rules
 from .scheduler import Scheduler
 
-try:
-    from .mock_runner import MockRunner
-except ImportError:
-    MockRunner = None
-
-
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tasker", description="交互式目标驱动多智能体编排器：输入目标 → 拆分 → Claude Agent SDK / Codex App Server 执行 → 直到 goal 达成")
     p.add_argument("--version", action="version", version=f"tasker {__version__}")
@@ -28,12 +22,10 @@ def _make_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=False)
 
     rp = sub.add_parser("repl", help="进入交互式 REPL（无参数默认）")
-    rp.add_argument("--mock", action="store_true", help="用模拟 runner 演示全流程（无需 claude/codex/API key）")
     rp.add_argument("--template", default=None, help="REPL 使用的任务拆解模板名称或 JSON 文件路径")
 
     r = sub.add_parser("run", help="交互式运行")
     r.add_argument("prompt", nargs="?", default="")
-    r.add_argument("--mock", action="store_true", help="用模拟 runner 演示全流程（无需 claude/codex/API key）")
     r.add_argument("--plan-rules", action="store_true", help="用规则拆分，不调用 LLM")
     r.add_argument("--think", choices=["full", "head", "off"], default="full", help="思维链输出：full 完整（默认）/ head 截断 / off 隐藏")
     r.add_argument("--no-input", action="store_true", help="关闭交互输入（仅流式输出）")
@@ -44,7 +36,6 @@ def _make_parser() -> argparse.ArgumentParser:
 
     pl = sub.add_parser("plan", help="打印拆分计划")
     pl.add_argument("prompt", nargs="?", default="")
-    pl.add_argument("--mock", action="store_true")
     pl.add_argument("--plan-rules", action="store_true")
     pl.add_argument("--json", action="store_true", help="以 JSON 输出计划")
     pl.add_argument("--template", default=None, help="任务拆解模板名称（从 tasker-template 模板库查找，也兼容文件路径）")
@@ -66,9 +57,6 @@ def _read_prompt(arg: str) -> str:
 
 def cmd_repl(args, cfg) -> int:
     """进入交互式 REPL（无参数默认入口）。"""
-    if getattr(args, "mock", False) or cfg.mock:
-        cfg.mock = True
-        _inject_mock_executor(cfg)
     from .repl import main_loop
 
     template = _load_template(args.template) if getattr(args, "template", None) else None
@@ -95,10 +83,7 @@ def cmd_run(args, cfg) -> int:
     )
 
     template = _load_template(args.template) if args.template else _auto_match_template(prompt)
-    if args.mock:
-        cfg.mock = True
-        plan = plan_with_rules(prompt, template=template)
-    elif args.plan_rules:
+    if args.plan_rules:
         plan = plan_with_rules(prompt, template=template)
     else:
         try:
@@ -106,9 +91,6 @@ def cmd_run(args, cfg) -> int:
         except LLMError as e:
             console.warn(f"任务拆分 LLM 不可用（{e}），回退到规则拆分")
             plan = plan_with_rules(prompt, template=template)
-
-    if args.mock:
-        _inject_mock_executor(cfg)
 
     sched = Scheduler(cfg, prompt, plan, tui)
     runs = sched.run()
@@ -259,20 +241,10 @@ def _auto_match_template(prompt: str) -> dict | None:
     return None
 
 
-def _inject_mock_executor(cfg) -> None:
-    import tasker.graph_executor as gx
-    import tasker.scheduler as sched_mod
-
-    if MockRunner is None:
-        return
-    gx.EXECUTOR_TO_RUNNER.update({"claude": MockRunner, "codex": MockRunner})
-    sched_mod.EXECUTOR_TO_RUNNER = {"claude": MockRunner, "codex": MockRunner}
-
-
 def cmd_plan(args, cfg) -> int:
     prompt = _read_prompt(args.prompt)
     template = _load_template(args.template) if args.template else _auto_match_template(prompt)
-    if args.mock or args.plan_rules:
+    if args.plan_rules:
         plan = plan_with_rules(prompt, template=template)
     else:
         try:

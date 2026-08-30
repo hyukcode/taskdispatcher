@@ -114,7 +114,6 @@ class Config:
     report_dir: str = "reports"
     max_parallel: int = 2
     timeout_per_task: float = 900.0
-    mock: bool = False
 
     @property
     def workspace_path(self) -> Path:
@@ -197,7 +196,6 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
     cfg.report_dir = data.get("report_dir", cfg.report_dir)
     cfg.max_parallel = int(data.get("max_parallel", cfg.max_parallel))
     cfg.timeout_per_task = float(data.get("timeout_per_task", cfg.timeout_per_task))
-    cfg.mock = bool(data.get("mock", cfg.mock))
     return cfg
 
 

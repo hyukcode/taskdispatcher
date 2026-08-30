@@ -129,9 +129,7 @@ class Repl:
         from .planner import plan_with_llm, plan_with_rules
 
         try:
-            plan = plan_with_rules(goal, template=self.template) if self.cfg.mock else plan_with_llm(
-                goal, self.cfg, emit=lambda e: None, template=self.template
-            )
+            plan = plan_with_llm(goal, self.cfg, emit=lambda e: None, template=self.template)
         except LLMError as e:
             console.warn(f"拆分 LLM 不可用（{e}），用规则拆分")
             plan = plan_with_rules(goal, template=self.template)
@@ -145,7 +143,7 @@ class Repl:
         c = self.cfg
         print(f"display.level={c.display.level}   dispatch.min_multiagent_steps={c.dispatch.min_multiagent_steps}")
         print(f"goal_loop.max_iterations={c.goal_loop.max_iterations}   evaluator={c.goal_loop.evaluator}")
-        print(f"approval.mode={c.approval.mode}   mock={c.mock}")
+        print(f"approval.mode={c.approval.mode}")
         print(f"session.dir={c.session.path}")
 
     def _run_goal(self, goal: str, session: Session | None = None) -> None:
