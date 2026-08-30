@@ -8,15 +8,14 @@ from pathlib import Path
 
 from . import console
 from .approvals import ApprovalBroker
-from .claude_runner import ClaudeRunner
 from .codex_app_server_runner import CodexAppServerRunner
-from .codex_runner import CodexRunner
 from .config import Config
 from .llm import chat
 from .models import CompiledGraph, Event, SubTask, TaskRun
 from .planner import _extract_json
+from .sdk_runner import SdkClaudeRunner
 
-EXECUTOR_TO_RUNNER = {"claude": ClaudeRunner, "codex": CodexRunner, "codex-app-server": CodexAppServerRunner}
+EXECUTOR_TO_RUNNER = {"claude": SdkClaudeRunner, "codex": CodexAppServerRunner}
 
 DEFAULT_MAX_LOOP_ITERATIONS = 5
 

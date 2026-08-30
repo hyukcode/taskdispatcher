@@ -74,7 +74,7 @@ class ApprovalBroker:
 
 
 class ApprovalPolicy:
-    """非自管理审批的决策策略（mock / claude stream-json 回退路径）。"""
+    """非自管理审批的决策策略（主要供 mock runner 使用）。"""
 
     def __init__(self, cfg: ApprovalConfig, on_decision=None):
         self.cfg = cfg

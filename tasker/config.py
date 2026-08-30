@@ -38,11 +38,7 @@ class CodexConfig:
     model: str = ""
     # read-only | workspace-write | danger-full-access
     sandbox: str = "workspace-write"
-    auto_approve: bool = False
-    skip_git_check: bool = True
-    full_trace: bool = True
     extra_args: list[str] = field(default_factory=list)
-    use_app_server: bool = True
     approval_policy: str = "on-request"
     completion_idle: float = 5.0
 
@@ -51,7 +47,7 @@ class CodexConfig:
 class ApprovalConfig:
     """审批请求处理方式。"""
 
-    mode: str = "auto"  # auto | log | ask_console | ptty
+    mode: str = "auto"  # auto | log | ask_console
     default_allow: bool = True
     timeout: float = 120.0
 
@@ -158,11 +154,7 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
         cfg.codex.binary = d.get("binary", cfg.codex.binary)
         cfg.codex.model = d.get("model", cfg.codex.model)
         cfg.codex.sandbox = d.get("sandbox", cfg.codex.sandbox)
-        cfg.codex.auto_approve = bool(d.get("auto_approve", cfg.codex.auto_approve))
-        cfg.codex.skip_git_check = bool(d.get("skip_git_check", cfg.codex.skip_git_check))
-        cfg.codex.full_trace = bool(d.get("full_trace", cfg.codex.full_trace))
         cfg.codex.extra_args = d.get("extra_args", cfg.codex.extra_args)
-        cfg.codex.use_app_server = bool(d.get("use_app_server", cfg.codex.use_app_server))
         cfg.codex.approval_policy = d.get("approval_policy", cfg.codex.approval_policy)
         cfg.codex.completion_idle = float(d.get("completion_idle", cfg.codex.completion_idle))
 
@@ -254,11 +246,7 @@ def save_example_config(path: str | Path) -> None:
             "binary": "codex",
             "model": "",
             "sandbox": "workspace-write",
-            "auto_approve": False,
-            "skip_git_check": True,
-            "full_trace": True,
             "extra_args": [],
-            "use_app_server": True,
             "approval_policy": "on-request",
             "completion_idle": 5.0,
         },

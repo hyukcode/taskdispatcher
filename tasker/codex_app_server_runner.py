@@ -1,7 +1,6 @@
-"""Codex App-Server 采集器（JSON-RPC over stdio，替代 codex exec）。
+"""Codex App-Server 采集器（JSON-RPC over stdio）。
 
-与 CodexRunner（codex exec --json 单次执行）相比：
-- app-server 是持久 JSON-RPC 2.0 进程，支持双向通信。
+app-server 是持久 JSON-RPC 进程，支持双向通信。
 - 关键升级：审批请求是 server→client 的 JSON-RPC request（带 id），
   编排器可以程序化批准/拒绝，实现和 SdkClaudeRunner.can_use_tool 对等的
   headless 审批能力。
@@ -59,7 +58,7 @@ _LOOP_OUTPUT_SCHEMA = {
 
 
 class CodexAppServerRunner:
-    """与 CodexRunner 相同的对外接口（start/is_done/finalize/stop/send_message/is_alive），
+    """提供统一 runner 接口（start/is_done/finalize/stop/send_message/is_alive），
     额外暴露 approval_respond/pending_approval_ids 供调度器把 :allow/:deny 送达。
     """
 

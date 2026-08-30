@@ -21,9 +21,6 @@
     "binary": "codex",
     "model": "",
     "sandbox": "workspace-write",
-    "auto_approve": false,
-    "skip_git_check": true,
-    "full_trace": true,
     "extra_args": []
   },
   "approval": {

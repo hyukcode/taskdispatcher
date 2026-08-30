@@ -8,14 +8,13 @@ from pathlib import Path
 
 from . import console
 from .approvals import ApprovalPolicy
-from .claude_runner import ClaudeRunner
 from .codex_app_server_runner import CodexAppServerRunner
-from .codex_runner import CodexRunner
 from .config import Config
 from .live import HELP, LiveTui
 from .models import Event, Plan, TaskRun
+from .sdk_runner import SdkClaudeRunner
 
-EXECUTOR_TO_RUNNER = {"claude": ClaudeRunner, "codex": CodexRunner, "codex-app-server": CodexAppServerRunner}
+EXECUTOR_TO_RUNNER = {"claude": SdkClaudeRunner, "codex": CodexAppServerRunner}
 
 
 class Scheduler:

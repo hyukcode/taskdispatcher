@@ -22,7 +22,7 @@ except ImportError:
 
 
 def _make_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tasker", description="交互式目标驱动多智能体编排器：输入目标 → 拆分 → claude code / codex 执行 → 直到 goal 达成")
+    p = argparse.ArgumentParser(prog="tasker", description="交互式目标驱动多智能体编排器：输入目标 → 拆分 → Claude Agent SDK / Codex App Server 执行 → 直到 goal 达成")
     p.add_argument("--version", action="version", version=f"tasker {__version__}")
     p.add_argument("--config", default=None, help="配置文件路径（默认 ./config.json）")
     sub = p.add_subparsers(dest="command", required=False)
@@ -34,9 +34,6 @@ def _make_parser() -> argparse.ArgumentParser:
     r = sub.add_parser("run", help="交互式运行")
     r.add_argument("prompt", nargs="?", default="")
     r.add_argument("--mock", action="store_true", help="用模拟 runner 演示全流程（无需 claude/codex/API key）")
-    r.add_argument("--use-sdk", action="store_true", default=True, help="claude 任务使用官方 claude-agent-sdk（默认启用；若未安装会自动降级到 stream-json）")
-    r.add_argument("--no-sdk", action="store_true", help="强制使用 stream-json 后端（关闭 SDK）")
-    r.add_argument("--no-app-server", action="store_true", help="强制使用 codex exec 后端（关闭 app-server JSON-RPC）")
     r.add_argument("--plan-rules", action="store_true", help="用规则拆分，不调用 LLM")
     r.add_argument("--think", choices=["full", "head", "off"], default="full", help="思维链输出：full 完整（默认）/ head 截断 / off 隐藏")
     r.add_argument("--no-input", action="store_true", help="关闭交互输入（仅流式输出）")
@@ -51,11 +48,6 @@ def _make_parser() -> argparse.ArgumentParser:
     pl.add_argument("--plan-rules", action="store_true")
     pl.add_argument("--json", action="store_true", help="以 JSON 输出计划")
     pl.add_argument("--template", default=None, help="任务拆解模板名称（从 tasker-template 模板库查找，也兼容文件路径）")
-
-    a = sub.add_parser("attach", help="ptty attach 到交互 TUI（macOS/Linux）")
-    a.add_argument("tool", choices=["claude", "codex"])
-    a.add_argument("prompt", nargs="*", default=[])
-    a.add_argument("--workdir", default=None)
 
     v = sub.add_parser("verify-config", help="检查环境")
     v.add_argument("--json", action="store_true")
@@ -77,9 +69,6 @@ def cmd_repl(args, cfg) -> int:
     if getattr(args, "mock", False) or cfg.mock:
         cfg.mock = True
         _inject_mock_executor(cfg)
-    else:
-        _inject_sdk_executor()
-        _inject_codex_app_server(cfg)
     from .repl import main_loop
 
     template = _load_template(args.template) if getattr(args, "template", None) else None
@@ -120,11 +109,6 @@ def cmd_run(args, cfg) -> int:
 
     if args.mock:
         _inject_mock_executor(cfg)
-    else:
-        if not args.no_sdk:
-            _inject_sdk_executor()
-        if not args.no_app_server:
-            _inject_codex_app_server(cfg)
 
     sched = Scheduler(cfg, prompt, plan, tui)
     runs = sched.run()
@@ -285,55 +269,6 @@ def _inject_mock_executor(cfg) -> None:
     sched_mod.EXECUTOR_TO_RUNNER = {"claude": MockRunner, "codex": MockRunner}
 
 
-def _inject_sdk_executor() -> bool:
-    import tasker.graph_executor as gx
-    import tasker.scheduler as sched_mod
-
-    try:
-        import claude_agent_sdk
-    except ImportError:
-        console.warn("claude-agent-sdk 未安装，claude 任务将使用 stream-json 后端（pip install claude-agent-sdk 可启用 headless 审批）")
-        return False
-
-    from .sdk_runner import SdkClaudeRunner
-
-    gx.EXECUTOR_TO_RUNNER["claude"] = SdkClaudeRunner
-    sched_mod.EXECUTOR_TO_RUNNER["claude"] = SdkClaudeRunner
-    return True
-
-
-def _inject_codex_app_server(cfg) -> bool:
-    if not cfg.codex.use_app_server:
-        return False
-
-    import subprocess
-
-    import tasker.graph_executor as gx
-    import tasker.scheduler as sched_mod
-
-    from .spawn import resolve_binary
-
-    try:
-        r = subprocess.run(
-            [resolve_binary(cfg.codex.binary), "app-server", "--help"],
-            capture_output=True,
-            timeout=10,
-        )
-        ok = r.returncode == 0
-    except Exception:
-        ok = False
-
-    if not ok:
-        console.warn("codex app-server 不可用（codex 版本过旧），codex 任务回退到 codex exec 后端")
-        return False
-
-    from .codex_app_server_runner import CodexAppServerRunner
-
-    gx.EXECUTOR_TO_RUNNER["codex"] = CodexAppServerRunner
-    sched_mod.EXECUTOR_TO_RUNNER["codex"] = CodexAppServerRunner
-    return True
-
-
 def cmd_plan(args, cfg) -> int:
     prompt = _read_prompt(args.prompt)
     template = _load_template(args.template) if args.template else _auto_match_template(prompt)
@@ -365,21 +300,6 @@ def cmd_plan(args, cfg) -> int:
             print(f"  {t.id} [{t.executor}] ← {','.join(t.depends_on) or '—'}  {t.title}")
             print(f"      {t.description.replace(chr(10), ' ')[:120]}")
     return 0
-
-
-def cmd_attach(args, cfg) -> int:
-    import tasker.ptty as ptty_mod
-
-    prompt = " ".join(args.prompt)
-    workdir = args.workdir or str(cfg.workspace_path)
-    os.makedirs(workdir, exist_ok=True)
-    console.info(f"attach 到 {args.tool}（工作目录 {workdir}）… Ctrl-D 结束后返回")
-    try:
-        rc = ptty_mod.run_attached(args.tool, workdir, prompt)
-    except NotImplementedError as e:
-        console.error(str(e))
-        return 2
-    return rc
 
 
 def cmd_verify(args, cfg) -> int:
@@ -432,8 +352,6 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_run(args, cfg)
         if args.command == "plan":
             return cmd_plan(args, cfg)
-        if args.command == "attach":
-            return cmd_attach(args, cfg)
         if args.command == "verify-config":
             return cmd_verify(args, cfg)
         if args.command == "init":
