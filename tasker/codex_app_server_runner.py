@@ -15,13 +15,14 @@ app-server 是持久 JSON-RPC 进程，支持双向通信。
 from __future__ import annotations
 
 import json
-import threading
 import time
 
 from . import __version__
-from .approvals import ApprovalBroker
 from .config import Config
-from .models import Event, TaskLoop, TaskRun
+from .formatting import compact_json as _compact
+from .loop_protocol import parse_loop_decision
+from .models import Event, TaskRun
+from .runner_base import EventSink, RunnerBase
 from .spawn import ProcChannel, resolve_binary, start_process
 
 # ---- 审批相关的 server→client 请求方法 ----
@@ -57,50 +58,28 @@ _LOOP_OUTPUT_SCHEMA = {
 }
 
 
-class CodexAppServerRunner:
+class CodexAppServerRunner(RunnerBase):
     """提供统一 runner 接口（start/is_done/finalize/stop/send_message/is_alive），
-    额外暴露 approval_respond/pending_approval_ids 供调度器把 :allow/:deny 送达。
+    额外暴露 approval_respond/pending_approval_ids 供 REPL 把 :allow/:deny 送达。
     """
 
     source = "codex"
-    self_handles_approval = True
+    config_key = "codex"
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
-        self.cfg = cfg
-        self.run = run
-        self.workdir = workdir
-        self.on_event = on_event
-        self.prompt = prompt
-        self.broker = broker or ApprovalBroker(cfg.approval)
+    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event: EventSink, prompt: str, broker=None):
+        super().__init__(cfg, run, workdir, on_event, prompt, broker=broker)
         self.channel: ProcChannel | None = None
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._rpc_id = 0
         self._thread_id: str | None = None
         self._turn_id: str | None = None
         self._turn_status: str | None = None
         self._handshake_ok = False
-        self._closed = False
         self._tool_names: dict[str, str] = {}
         self._buffers: dict[str, dict] = {}  # itemId → {"kind":"text"|"thinking","parts":[str]}
-        self._interactions: list[str] = []
-        self._result_ts: float | None = None
-        self._injection_ts: float | None = None
-        self._last_event_ts = time.time()
-        self._settle = float(getattr(cfg.codex, "completion_idle", 5.0))
-        self._steer_queue: list[str] = []
-        self._steer_lock = threading.Lock()
         self._turn_active = False
         self._pending_turn_starts: dict[int, bool] = {}
+        self._responses: dict[object, dict] = {}
         self._turn_output = ""
-        self._internal_loop: TaskLoop | None = None
-        self._loop_iteration = 0
-
-    def set_internal_loop(self, loop: TaskLoop | None) -> None:
-        """配置任务内部 loop；必须在 start() 前调用。"""
-        self._internal_loop = loop if loop and loop.enabled else None
-        if self._internal_loop is not None:
-            self._internal_loop.max_iterations = max(1, int(self._internal_loop.max_iterations))
 
     # ---------- 生命周期 ----------
     def build_args(self) -> list[str]:
@@ -110,28 +89,13 @@ class CodexAppServerRunner:
         args += c.extra_args
         return args
 
-    def start(self) -> ProcChannel | None:
-        self.run.started_at = time.time()
+    def _prepare_start(self) -> None:
         self.channel = start_process(self.build_args(), workdir=self.workdir, name=f"codex-as-{self.run.task.id}")
-        self._thread = threading.Thread(target=self._pump, daemon=True, name=f"codex-as-{self.run.task.id}")
-        self._thread.start()
+
+    def _start_result(self) -> ProcChannel | None:
         return self.channel
 
-    # ---------- 完成判定（同 sdk_runner 的 settle 逻辑）----------
-    def is_alive(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
-    def is_done(self) -> bool:
-        if self._closed or not self.is_alive():
-            return True
-        if self._result_ts is None:
-            return False
-        ref = max(self._result_ts, self._injection_ts or 0)
-        now = time.time()
-        return (now - ref) > self._settle and (now - self._last_event_ts) > self._settle
-
-    def finalize(self) -> None:
-        self._stop.set()
+    def _finalize_transport(self) -> None:
         if self.channel and self.channel.is_alive():
             self.channel.close_stdin()
             try:
@@ -139,82 +103,66 @@ class CodexAppServerRunner:
             except Exception:
                 self.channel.stop()
 
-    def stop(self) -> None:
-        self._stop.set()
+    def _stop_transport(self) -> None:
         if self.channel:
             self.channel.stop()
 
     # ---------- 中途注入 ----------
-    def send_message(self, text: str) -> bool:
-        if self._stop.is_set() or not self.channel or not self.channel.is_alive():
-            return False
-        self._interactions.append(text)
-        self._injection_ts = time.time()
-        self._emit(Event(kind="user_message", source=self.source, text=text))
-        with self._steer_lock:
-            if not self._handshake_ok or not self._thread_id:
-                self._steer_queue.append(text)
-                return True
-            if self._turn_active and self._turn_id and not self._pending_turn_starts:
-                self._send_steer(text)
-                return True
+    def _can_accept_message(self) -> bool:
+        return bool(self.channel and self.channel.is_alive())
+
+    def _drain_input_queue(self) -> None:
+        """只在 pump 线程中消费，保证 turn 状态和发送操作串行化。"""
+        if not self._handshake_ok or not self._thread_id or self._pending_turn_starts:
+            return
+        while not self._stop.is_set():
+            available, text = self._take_input_nowait()
+            if not available or text is None:
+                return
+            if self._turn_active and self._turn_id:
+                if not self._send_steer(text):
+                    self._finish_failure("无法发送 turn/steer")
+                    return
+                continue
             # turn/completed 之后必须开启新的 turn，不能再 steer 已结束的 turn。
-            if self._pending_turn_starts:
-                self._steer_queue.append(text)
-                return True
-        return self._start_followup_turn(text, internal=False)
-
-    # ---------- 审批接口（duck-typed，供 scheduler 的 :allow/:deny 路由）----------
-    @property
-    def pending_approval_ids(self) -> list[str]:
-        return self.broker.pending_ids
-
-    def approval_respond(self, req_id: str, allowed: bool) -> bool:
-        return self.broker.resolve(req_id, allowed=allowed)
+            self._start_followup_turn(text, internal=False)
+            return
 
     # ================================================================
     #  事件泵
     # ================================================================
-    def _emit(self, event: Event) -> None:
-        self._last_event_ts = time.time()
-        self.run.events.append(event)
-        self.on_event(self.run, event)
+    def _run_transport(self) -> None:
+        self._pump()
 
     def _pump(self) -> None:
         ch = self.channel
         if not ch:
             return
-        try:
-            self._handshake(ch)
-            if not self._handshake_ok:
-                return
-            # 补发握手中排队的 steer 消息
-            with self._steer_lock:
-                for text in self._steer_queue:
-                    self._send_steer(text)
-                self._steer_queue.clear()
+        self._handshake(ch)
+        if not self._handshake_ok:
+            return
+        self._drain_input_queue()
 
-            while not self._stop.is_set():
-                line = ch.next_line(timeout=0.2)
-                if line is None:
-                    if not ch.is_alive():
-                        break
-                    continue
-                self._last_event_ts = time.time()
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    msg = json.loads(line)
-                except json.JSONDecodeError:
-                    self._emit(Event(kind="raw", source=self.source, text=line[:2000]))
-                    continue
-                try:
-                    self._dispatch(msg)
-                except Exception as e:  # noqa: BLE001
-                    self._emit(Event(kind="error", source=self.source, text=f"消息处理失败: {e}"))
-        finally:
-            self.run.ended_at = time.time()
+        while not self._stop.is_set():
+            self._drain_input_queue()
+            line = ch.next_line(timeout=0.2)
+            if line is None:
+                if not ch.is_alive():
+                    break
+                continue
+            self._last_event_ts = time.time()
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                self._emit(Event(kind="raw", source=self.source, text=line[:2000]))
+                continue
+            try:
+                self._dispatch(msg)
+            except Exception as e:  # noqa: BLE001
+                self._emit(Event(kind="error", source=self.source, text=f"消息处理失败: {e}"))
 
     # ================================================================
     #  握手
@@ -231,9 +179,8 @@ class CodexAppServerRunner:
         )
         resp = self._await_response(ch, rid, timeout=15)
         if resp is None or "error" in resp:
-            self.run.exit_code = 1
             err = (resp or {}).get("error", {}).get("message", "无响应")
-            self._emit(Event(kind="error", source=self.source, text=f"app-server 握手失败 (initialize): {err}"))
+            self._finish_failure(f"app-server 握手失败 (initialize): {err}")
             return
 
         # 2) initialized
@@ -258,17 +205,15 @@ class CodexAppServerRunner:
         )
         resp = self._await_response(ch, rid, timeout=30)
         if resp is None or "error" in resp:
-            self.run.exit_code = 1
             err = (resp or {}).get("error", {}).get("message", "无响应")
-            self._emit(Event(kind="error", source=self.source, text=f"thread/start 失败: {err}"))
+            self._finish_failure(f"thread/start 失败: {err}")
             return
 
         result = resp.get("result", {})
         thread = result.get("thread", result)
         self._thread_id = thread.get("id")
         if not self._thread_id:
-            self.run.exit_code = 1
-            self._emit(Event(kind="error", source=self.source, text="thread/start 未返回 thread.id"))
+            self._finish_failure("thread/start 未返回 thread.id")
             return
 
         # 4) turn/start
@@ -291,22 +236,20 @@ class CodexAppServerRunner:
         )
         resp = self._await_response(ch, rid, timeout=30)
         if resp is None or "error" in resp:
-            self.run.exit_code = 1
             err = (resp or {}).get("error", {}).get("message", "无响应")
-            self._emit(Event(kind="error", source=self.source, text=f"turn/start 失败: {err}"))
+            self._finish_failure(f"turn/start 失败: {err}")
             return
 
         result = resp.get("result", {})
         turn = result.get("turn", result)
         self._turn_id = turn.get("id")
         if not self._turn_id:
-            self.run.exit_code = 1
-            self._emit(Event(kind="error", source=self.source, text="turn/start 未返回 turn.id"))
+            self._finish_failure("turn/start 未返回 turn.id")
             return
 
         self._turn_active = True
         self._handshake_ok = True
-        self.run.exit_code = 0
+        self.run.status = "running"
         self._emit(
             Event(
                 kind="system",
@@ -318,6 +261,9 @@ class CodexAppServerRunner:
 
     def _await_response(self, ch: ProcChannel, rpc_id: int, timeout: float) -> dict | None:
         """等待指定 id 的响应，期间的通知照常采集。"""
+        cached = self._responses.pop(rpc_id, None)
+        if cached is not None:
+            return cached
         deadline = time.time() + timeout
         while time.time() < deadline and not self._stop.is_set():
             line = ch.next_line(timeout=0.2)
@@ -334,13 +280,17 @@ class CodexAppServerRunner:
             except json.JSONDecodeError:
                 self._emit(Event(kind="raw", source=self.source, text=line[:2000]))
                 continue
-            if "id" in msg and "method" not in msg:
+            if "method" in msg:
+                if "id" in msg:
+                    self._handle_server_request(msg)
+                else:
+                    self._dispatch_notification(msg)
+                continue
+            if "id" in msg:
                 if msg.get("id") == rpc_id:
                     return msg
-                # 其他响应（如延迟到达的旧请求）忽略
+                self._responses[msg.get("id")] = msg
                 continue
-            if "method" in msg:
-                self._dispatch_notification(msg)
         return None
 
     # ================================================================
@@ -373,7 +323,7 @@ class CodexAppServerRunner:
                         data={"thread_id": self._thread_id, "turn_id": self._turn_id, "internal_loop": True},
                     )
                 )
-                self._flush_queued_steers()
+                self._drain_input_queue()
                 return
             if "error" in msg:
                 self._emit(
@@ -682,16 +632,17 @@ class CodexAppServerRunner:
         output = _turn_output(turn, self._turn_output)
         self.run.output = output
 
-        if status == "failed":
+        if status != "completed":
             error_info = turn.get("error", {})
             self.run.exit_code = 1
             self.run.status = "failed"
-            self.run.output = str(error_info.get("message", "") or _compact(error_info, 500))
+            detail = str(error_info.get("message", "") or _compact(error_info, 500))
+            self.run.output = detail or f"turn 结束状态: {status}"
             self._emit(
                 Event(
                     kind="error",
                     source=self.source,
-                    text=f"turn failed: {self.run.output}",
+                    text=f"turn 未成功完成（{status}）: {self.run.output}",
                     data={"status": status, "error": error_info},
                 )
             )
@@ -705,7 +656,10 @@ class CodexAppServerRunner:
             )
             return
 
-        decision = _loop_decision(output) if self._internal_loop and status == "completed" else None
+        decision = parse_loop_decision(output) if self._internal_loop and status == "completed" else None
+        if self._internal_loop is not None and decision is None:
+            self._finish_failure("任务内部 loop 未返回有效的 passed/needs_iteration JSON")
+            return
         if (
             decision
             and decision.get("status") == "needs_iteration"
@@ -728,7 +682,13 @@ class CodexAppServerRunner:
             self._start_followup_turn(self._loop_prompt(feedback), internal=True)
             return
 
-        # completed / interrupted
+        if self._internal_loop is not None and decision.get("status") == "needs_iteration":
+            self._finish_failure(
+                f"任务内部 loop 已达到最大轮次（{self._internal_loop.max_iterations}），仍未满足退出条件"
+            )
+            return
+
+        # completed
         self.run.exit_code = 0
         self.run.status = "success"
         # 从最后一个 agentMessage item 提取输出
@@ -871,12 +831,12 @@ class CodexAppServerRunner:
             payload["result"] = result or {}
         self._write(payload)
 
-    def _send_steer(self, text: str) -> None:
-        """在 pump 线程内调用；调用前需持有 _steer_lock。"""
+    def _send_steer(self, text: str) -> bool:
+        """仅在 pump 线程内调用，确保 turn 状态与发送操作串行化。"""
         if not self._thread_id or not self._turn_id:
-            return
+            return False
         rid = self._next_id()
-        self._write(
+        return self._write(
             {
                 "id": rid,
                 "method": "turn/steer",
@@ -902,8 +862,10 @@ class CodexAppServerRunner:
 
     def _loop_prompt(self, feedback: str) -> str:
         extra = self._internal_loop.feedback_prompt if self._internal_loop else ""
+        condition = self._internal_loop.exit_condition if self._internal_loop else ""
         return (
             "继续当前任务的内部迭代。请根据上一轮反馈检查实际文件、运行必要的验证并修正问题。\n"
+            f"退出条件：{condition or '满足任务验收标准'}\n"
             f"上一轮反馈：{feedback}\n"
             f"额外迭代要求：{extra or '无'}\n"
             "完成后仍然只按约定的结构化结果报告：status=passed 或 status=needs_iteration，并给出 feedback。"
@@ -920,6 +882,8 @@ class CodexAppServerRunner:
         self._reset_turn_output()
         self._turn_active = False
         self._turn_status = "inProgress"
+        self.run.exit_code = None
+        self.run.status = "running"
         self._result_ts = None
         rid = self._next_id()
         self._pending_turn_starts[rid] = internal
@@ -943,32 +907,6 @@ class CodexAppServerRunner:
             self._pending_turn_starts.pop(rid, None)
             self._finish_failure("无法发送 follow-up turn/start")
         return ok
-
-    def _flush_queued_steers(self) -> None:
-        with self._steer_lock:
-            queued = list(self._steer_queue)
-            self._steer_queue.clear()
-            if self._turn_active and self._turn_id:
-                for text in queued:
-                    self._send_steer(text)
-            else:
-                self._steer_queue[:0] = queued
-
-    def _finish_failure(self, message: str) -> None:
-        self.run.exit_code = 1
-        self.run.status = "failed"
-        self.run.output = message
-        self._result_ts = time.time()
-        self._emit(Event(kind="error", source=self.source, text=message))
-
-
-def _compact(obj, width: int) -> str:
-    """截断 JSON 表示到指定宽度。"""
-    try:
-        s = json.dumps(obj, ensure_ascii=False, default=str)
-    except Exception:  # noqa: BLE001
-        s = str(obj)
-    return s if len(s) <= width else s[: width - 1] + "…"
 
 
 def _usage_text(usage) -> str:
@@ -1035,28 +973,3 @@ def _turn_output(turn: dict, fallback: str) -> str:
             if isinstance(value, str) and value.strip():
                 return value
     return fallback or ""
-
-
-def _loop_decision(output: str) -> dict | None:
-    """解析 outputSchema 结果；兼容少数版本仍把 JSON 包在 markdown 中的情况。"""
-    text = (output or "").strip()
-    if not text:
-        return None
-    candidates = [text]
-    if "```" in text:
-        candidates.extend(part.strip() for part in text.split("```") if part.strip())
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            start = candidate.find("{")
-            if start < 0:
-                continue
-            try:
-                value, _ = decoder.raw_decode(candidate[start:])
-            except json.JSONDecodeError:
-                continue
-        if isinstance(value, dict) and value.get("status") in {"passed", "needs_iteration"}:
-            return value
-    return None

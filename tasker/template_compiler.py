@@ -10,8 +10,6 @@ from .config import Config
 from .llm import LLMError, chat
 from .models import (
     CompiledGraph,
-    ConditionalBranch,
-    ConditionalEdge,
     GraphEdge,
     SubTask,
     graph_from_dict,
@@ -46,6 +44,24 @@ LOOP_INFER_PROMPT = """\
   "rationale": "一句话说明判断依据"
 }
 """
+
+
+def load_named_template(name: str) -> dict | None:
+    """从 tasker-template 加载模板，供 CLI 和 GoalLoop 共用。"""
+    try:
+        from template import get_template
+    except ImportError:
+        return None
+    try:
+        template = get_template(name)
+    except Exception as e:  # noqa: BLE001
+        console.warn(f"模板查找失败（{name}）: {e}")
+        return None
+    if not template:
+        return None
+    result = dict(template)
+    result.pop("_meta", None)
+    return result
 
 
 def _extract_json(text: str) -> dict:
@@ -123,28 +139,16 @@ def apply_loop(graph: CompiledGraph, info: dict) -> CompiledGraph:
     if not info.get("loop"):
         return graph
 
-    ids = {n.id for n in graph.nodes}
-
-    cond_edges: list[ConditionalEdge] = []
-    back_edges: list[GraphEdge] = []
-    for ce in info.get("conditional_edges") or []:
-        src = str(ce.get("from", ""))
-        branches = [
-            ConditionalBranch(condition=str(b.get("condition", "")), dst=str(b.get("to", "")))
-            for b in (ce.get("branches") or [])
-        ]
-        cond_edges.append(ConditionalEdge(src=src, branches=branches))
-
-    for be in info.get("loop_back_edges") or []:
-        back_edges.append(GraphEdge(src=str(be.get("from", "")), dst=str(be.get("to", ""))))
-
-    exit_condition = str(info.get("exit_condition", "") or "")
-    loop_sources = {edge.src for edge in back_edges}
+    loop_sources = {
+        str(edge.get("from", edge.get("src", "")))
+        for edge in (info.get("loop_back_edges") or [])
+    }
     loop_sources.update(
-        edge.src
-        for edge in cond_edges
-        if any(branch.dst != "__end__" for branch in edge.branches)
+        str(edge.get("from", edge.get("src", "")))
+        for edge in (info.get("conditional_edges") or [])
+        if any(branch.get("to", branch.get("dst", "")) != "__end__" for branch in (edge.get("branches") or []))
     )
+    exit_condition = str(info.get("exit_condition", "") or "")
     for node in graph.nodes:
         if node.id in loop_sources and node.internal_loop is None:
             node.internal_loop = task_loop_from_dict(
@@ -156,10 +160,6 @@ def apply_loop(graph: CompiledGraph, info: dict) -> CompiledGraph:
                 }
             )
 
-    graph.conditional_edges = cond_edges
-    graph.loop_back_edges = back_edges
-    graph.loop = False
-    graph.exit_condition = exit_condition
     return graph
 
 

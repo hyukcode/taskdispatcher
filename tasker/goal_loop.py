@@ -6,13 +6,12 @@ import threading
 
 from . import console
 from .config import Config
-from .dispatch import build_single_task, is_short_circuit
 from .graph_executor import GraphExecutor
 from .llm import LLMError
-from .models import CompiledGraph, GraphEdge, Plan, Session, SubTask
+from .models import CompiledGraph, Event, GraphEdge, Plan, Session, SubTask, TaskRun
 from .planner import _extract_json, plan_with_llm, plan_with_rules
 from .session import SessionStore
-from .template_compiler import compile_template
+from .template_compiler import compile_template, load_named_template
 
 EVALUATOR_INSTRUCTION = """\
 请先读取当前工作目录中的产物核实，再严格只输出 JSON（不要 markdown 代码块）：
@@ -45,23 +44,6 @@ def plan_to_graph(plan: Plan, template: dict | None, cfg: Config | None = None) 
     return graph
 
 
-def _load_template(name: str) -> dict | None:
-    try:
-        from template import get_template
-
-        tpl = get_template(name)
-        if not tpl:
-            return None
-        tpl = dict(tpl)
-        tpl.pop("_meta", None)
-        return tpl
-    except ImportError:
-        return None
-    except Exception as e:
-        console.warn(f"模板加载失败（{name}）: {e}")
-        return None
-
-
 def _parse_verdict(output: str) -> dict:
     try:
         data = _extract_json(output)
@@ -81,7 +63,6 @@ class GoalLoop:
         emit=None,
         planner=None,
         evaluator=None,
-        judge=None,
         template: dict | None = None,
     ):
         self.cfg = cfg
@@ -90,7 +71,6 @@ class GoalLoop:
         self.emit = emit or (lambda run, event: console.event_line(event.summary(), source=event.source))
         self.planner = planner or self._default_planner
         self.evaluator = evaluator or self._code_agent_evaluator
-        self.judge = judge
         self.template = template
         self.session: Session | None = None
         self.current: GraphExecutor | None = None
@@ -116,7 +96,7 @@ class GoalLoop:
         self.session = session
         if not session.goal:
             session.goal = goal
-        max_iter = self.cfg.goal_loop.max_iterations
+        max_iter = max(1, int(self.cfg.goal_loop.max_iterations))
 
         while session.iteration < max_iter:
             if self._stop_event.is_set():
@@ -124,13 +104,19 @@ class GoalLoop:
             session.iteration += 1
             console.banner(f"goal 迭代 {session.iteration}/{max_iter}")
 
-            plan = self._plan(goal, session.state)
-            console.dim(f"拆分：{len(plan.tasks)} 个任务" + (f"（模板 {plan.template}）" if plan.template else ""))
+            try:
+                plan = self._plan(goal, session.state)
+                console.dim(f"拆分：{len(plan.tasks)} 个任务" + (f"（模板 {plan.template}）" if plan.template else ""))
 
-            template = _load_template(plan.template) if plan.template else None
-            graph = plan_to_graph(plan, template, self.cfg)
-
-            summary = self._execute(graph, session)
+                template = load_named_template(plan.template) if plan.template else None
+                graph = plan_to_graph(plan, template, self.cfg)
+                summary = self._execute(graph, session)
+            except Exception as e:  # noqa: BLE001
+                session.status = "failed"
+                session.state["error"] = str(e)
+                self.store.save(session)
+                self._emit(None, Event(kind="error", source="orchestrator", text=f"任务图执行失败: {e}"))
+                return session
             if self._stop_event.is_set():
                 break
 
@@ -183,26 +169,20 @@ class GoalLoop:
             return plan_with_rules(prompt, template=self.template)
 
     def _execute(self, graph: CompiledGraph, session: Session) -> str:
-        workdir = str(self.store.workspace(session.session_id))
+        return self._summarize(self._execute_graph(graph, session))
 
-        if is_short_circuit(graph, self.cfg.dispatch.min_multiagent_steps):
-            console.step(f"小任务短路：单 agent 直接执行（{len(graph.nodes)} 节点）")
-            task = build_single_task(graph, goal=session.goal)
-            short = CompiledGraph(nodes=[task], entry=task.id)
-            ex = GraphExecutor(
-                self.cfg, short, self.broker, workdir=workdir, emit=self._emit, goal=session.goal, state=session.state
-            )
-        else:
-            ex = GraphExecutor(
-                self.cfg, graph, self.broker, workdir=workdir, emit=self._emit,
-                goal=session.goal, state=session.state, judge=self.judge,
-            )
+    def _execute_graph(self, graph: CompiledGraph, session: Session) -> list[TaskRun]:
+        """统一执行入口：普通任务图与 evaluator 共用同一 session 工作区。"""
+        workdir = str(self.store.workspace(session.session_id))
+        ex = GraphExecutor(
+            self.cfg, graph, self.broker, workdir=workdir, emit=self._emit,
+            goal=session.goal, state=session.state,
+        )
         self.current = ex
         try:
-            runs = ex.execute()
+            return ex.execute()
         finally:
             self.current = None
-        return self._summarize(runs)
 
     def send_message(self, target: str, text: str) -> list[str]:
         return self.current.send_message(target, text) if self.current else []
@@ -228,14 +208,6 @@ class GoalLoop:
         )
         graph = CompiledGraph(nodes=[node], entry=node.id)
         console.step(f"启动 evaluator code agent [{self.cfg.goal_loop.evaluator}] 判定 goal")
-        ex = GraphExecutor(
-            self.cfg, graph, self.broker, workdir=str(self.store.workspace(session.session_id)),
-            emit=self._emit, goal=goal, state=state,
-        )
-        self.current = ex
-        try:
-            runs = ex.execute()
-        finally:
-            self.current = None
+        runs = self._execute_graph(graph, session)
         output = runs[0].output if runs else ""
         return _parse_verdict(output)

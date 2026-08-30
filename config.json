@@ -9,13 +9,11 @@
     "timeout": 120
   },
   "claude": {
-    "binary": "claude",
     "model": "",
     "permission_mode": "acceptEdits",
     "allowed_tools": [],
     "disallowed_tools": [],
-    "completion_idle": 5.0,
-    "extra_args": []
+    "completion_idle": 5.0
   },
   "codex": {
     "binary": "codex",
@@ -28,10 +26,11 @@
     "default_allow": true,
     "timeout": 120
   },
-  "workspace_dir": "workspaces",
-  "report_dir": "reports",
+  "session": {
+    "dir": "~/.tasker/sessions",
+    "workspace_dir": "~/.tasker/workspace"
+  },
   "dispatch": {
-    "min_multiagent_steps": 3,
     "strategy": "codex-first-review",
     "complex_executor": "codex",
     "implementation_executor": "claude",

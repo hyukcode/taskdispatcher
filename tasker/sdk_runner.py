@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 from concurrent import futures
 
-from .approvals import ApprovalBroker
 from .config import Config
-from .models import Event, TaskLoop, TaskRun
+from .formatting import compact_json as _compact
+from .loop_protocol import parse_loop_decision
+from .models import Event, TaskRun
+from .runner_base import EventSink, RunnerBase
 
 try:
     import claude_agent_sdk as sdk
@@ -17,69 +18,69 @@ except ImportError:
     sdk = None
 
 
-class SdkClaudeRunner:
+class SdkClaudeRunner(RunnerBase):
     source = "claude"
-    self_handles_approval = True
+    config_key = "claude"
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event, prompt: str, broker=None):
-        self.cfg = cfg
-        self.run = run
-        self.workdir = workdir
-        self.on_event = on_event
-        self.prompt = prompt
-        self.broker = broker or ApprovalBroker(cfg.approval)
+    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event: EventSink, prompt: str, broker=None):
+        super().__init__(cfg, run, workdir, on_event, prompt, broker=broker)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client = None
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
         self._tool_names: dict[str, str] = {}
-        self._interactions: list[str] = []
-        self._result_ts: float | None = None
-        self._injection_ts: float | None = None
-        self._last_event_ts: float = time.time()
-        self._settle = float(getattr(cfg.claude, "completion_idle", 5.0))
-        self._internal_loop: TaskLoop | None = None
-        self._loop_iteration = 0
         self._next_loop_prompt = ""
 
-    def set_internal_loop(self, loop: TaskLoop | None) -> None:
-        self._internal_loop = loop if loop and loop.enabled else None
-        if self._internal_loop is not None:
-            self._internal_loop.max_iterations = max(1, int(self._internal_loop.max_iterations))
-
-    def start(self) -> None:
+    def _prepare_start(self) -> None:
         if sdk is None:
             raise RuntimeError("未安装 claude-agent-sdk：请先 `pip install claude-agent-sdk`（仅 --use-sdk 需要）")
-        self.run.started_at = time.time()
-        self._thread = threading.Thread(target=self._amain, daemon=True, name=f"sdk-claude-{self.run.task.id}")
-        self._thread.start()
 
-    def _amain(self) -> None:
-        try:
-            asyncio.run(self._arun())
-        except Exception as e:
-            self._emit(Event(kind="error", source=self.source, text=f"SDK 事件泵异常: {e}"))
-        finally:
-            self.run.ended_at = time.time()
+    def _run_transport(self) -> None:
+        asyncio.run(self._arun())
 
     async def _arun(self) -> None:
         self._loop = asyncio.get_running_loop()
         opts = self._build_options()
         async with sdk.ClaudeSDKClient(options=opts) as client:
             self._client = client
-            await client.query(self._sys_prompt())
-            while not self._stop.is_set():
-                continue_loop = False
-                async for msg in client.receive_response():
-                    if self._stop.is_set():
+            self._query_lock = asyncio.Lock()
+            await self._query(client, self._sys_prompt())
+            input_task = asyncio.create_task(self._consume_input(client))
+            try:
+                while not self._stop.is_set():
+                    continue_loop = False
+                    async for msg in client.receive_response():
+                        if self._stop.is_set():
+                            break
+                        try:
+                            continue_loop = self._handle(msg) or continue_loop
+                        except Exception as e:
+                            self._emit(Event(kind="error", source=self.source, text=f"事件处理失败: {e}"))
+                    if not continue_loop:
                         break
-                    try:
-                        continue_loop = self._handle(msg) or continue_loop
-                    except Exception as e:
-                        self._emit(Event(kind="error", source=self.source, text=f"事件处理失败: {e}"))
-                if not continue_loop:
-                    break
-                await client.query(self._next_loop_prompt)
+                    await self._query(client, self._next_loop_prompt)
+            finally:
+                input_task.cancel()
+                try:
+                    await input_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _query(self, client, text: str) -> None:
+        async with self._query_lock:
+            await client.query(text)
+
+    async def _consume_input(self, client) -> None:
+        """在 SDK 所属事件循环中顺序消费用户注入，避免并发 query。"""
+        while not self._stop.is_set():
+            available, text = self._take_input_nowait()
+            if not available:
+                await asyncio.sleep(0.05)
+                continue
+            if text is None:
+                return
+            try:
+                await self._query(client, text)
+            except Exception as exc:  # noqa: BLE001
+                self._emit(Event(kind="error", source=self.source, text=f"注入消息发送失败: {exc}"))
 
     def _build_options(self):
         c = self.cfg.claude
@@ -122,21 +123,8 @@ class SdkClaudeRunner:
             )
         return prompt
 
-    def is_alive(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
-    def is_done(self) -> bool:
-        if not self.is_alive():
-            return True
-        if self._result_ts is None:
-            return False
-        ref = max(self._result_ts, self._injection_ts or 0)
-        now = time.time()
-        return (now - ref) > self._settle and (now - self._last_event_ts) > self._settle
-
-    def finalize(self) -> None:
-        """收尾：断开 SDK 传输，让 receive_response() 结束，事件泵线程退出。"""
-        self._stop.set()
+    def _finalize_transport(self) -> None:
+        """断开 SDK 传输，让 receive_response() 结束。"""
         client = self._client
         if client is not None:
             try:
@@ -144,25 +132,12 @@ class SdkClaudeRunner:
             except Exception:
                 pass
 
-    def stop(self) -> None:
-        self._stop.set()
+    def _stop_transport(self) -> None:
         if self._client is not None:
             try:
                 self._client.disconnect()
             except Exception:
                 pass
-
-    def send_message(self, text: str) -> bool:
-        if not self._client or not self._loop or self._stop.is_set():
-            return False
-        try:
-            asyncio.run_coroutine_threadsafe(self._client.query(text), self._loop)
-            self._interactions.append(text)
-            self._injection_ts = time.time()
-            self._emit(Event(kind="user_message", source=self.source, text=text))
-            return True
-        except Exception:  # noqa: BLE001
-            return False
 
     async def _can_use_tool(self, tool_name: str, input_data: dict, context) -> sdk.PermissionResult:
         tool_use_id = (context.tool_use_id if context is not None else None) or str(time.time())
@@ -211,18 +186,6 @@ class SdkClaudeRunner:
             )
         )
 
-    @property
-    def pending_approval_ids(self) -> list[str]:
-        return self.broker.pending_ids
-
-    def approval_respond(self, req_id: str, allowed: bool) -> bool:
-        return self.broker.resolve(req_id, allowed=allowed)
-
-    def _emit(self, event: Event) -> None:
-        self._last_event_ts = time.time()
-        self.run.events.append(event)
-        self.on_event(self.run, event)
-
     def _handle(self, msg) -> bool:
         if isinstance(msg, sdk.SystemMessage):
             self._handle_system(msg)
@@ -249,7 +212,6 @@ class SdkClaudeRunner:
         sub = msg.subtype
         data = msg.data or {}
         if sub == "init":
-            self.run.exit_code = 0
             self._emit(
                 Event(
                     kind="system",
@@ -323,7 +285,13 @@ class SdkClaudeRunner:
                 )
             )
 
-        decision = _loop_decision(self.run.output) if self._internal_loop and not msg.is_error else None
+        decision = parse_loop_decision(self.run.output) if self._internal_loop and not msg.is_error else None
+        if self._internal_loop is not None and not msg.is_error and decision is None:
+            self.run.exit_code = 1
+            self.run.status = "failed"
+            self.run.error = "任务内部 loop 未返回有效的 passed/needs_iteration JSON"
+            self._emit(Event(kind="error", source=self.source, text=self.run.error))
+            return False
         if (
             decision
             and decision.get("status") == "needs_iteration"
@@ -337,6 +305,7 @@ class SdkClaudeRunner:
             self._result_ts = None
             self._next_loop_prompt = (
                 "继续当前任务的内部迭代。请在同一个工作区中根据上一轮反馈检查、修正并验证。\n"
+                f"退出条件：{self._internal_loop.exit_condition or '满足任务验收标准'}\n"
                 f"上一轮反馈：{feedback}\n"
                 "完成后再次输出 status=passed 或 status=needs_iteration，并给出 feedback。"
             )
@@ -350,7 +319,21 @@ class SdkClaudeRunner:
             )
             return True
 
+        if (
+            self._internal_loop is not None
+            and not msg.is_error
+            and decision.get("status") == "needs_iteration"
+        ):
+            self.run.exit_code = 1
+            self.run.status = "failed"
+            self.run.error = f"任务内部 loop 已达到最大轮次（{self._internal_loop.max_iterations}），仍未满足退出条件"
+            self._emit(Event(kind="error", source=self.source, text=self.run.error))
+            return False
+
         self.run.exit_code = 0 if not msg.is_error else 1
+        self.run.status = "success" if not msg.is_error else "failed"
+        if msg.is_error:
+            self.run.error = self.run.output or "Claude SDK 返回错误"
         for d in msg.permission_denials or []:
             text = d.get("message", "") if isinstance(d, dict) else str(d)
             self._emit(Event(kind="permission_result", source=self.source, text=str(text), data={"allowed": False, "detail": d}))
@@ -369,14 +352,6 @@ class SdkClaudeRunner:
             )
         )
         return False
-
-
-def _compact(obj, width: int) -> str:
-    try:
-        s = json.dumps(obj, ensure_ascii=False, default=str)
-    except Exception:
-        s = str(obj)
-    return s if len(s) <= width else s[: width - 1] + "…"
 
 
 def _usage_dict(value) -> dict:
@@ -398,27 +373,3 @@ def _usage_dict(value) -> dict:
     except TypeError:
         return {}
     return dict(data) if isinstance(data, dict) else {}
-
-
-def _loop_decision(output: str) -> dict | None:
-    text = (output or "").strip()
-    if not text:
-        return None
-    candidates = [text]
-    if "```" in text:
-        candidates.extend(part.strip() for part in text.split("```") if part.strip())
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            start = candidate.find("{")
-            if start < 0:
-                continue
-            try:
-                value, _ = decoder.raw_decode(candidate[start:])
-            except json.JSONDecodeError:
-                continue
-        if isinstance(value, dict) and value.get("status") in {"passed", "needs_iteration"}:
-            return value
-    return None

@@ -4,7 +4,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
-EXECUTORS = ("claude", "codex", "human", "llm")
+from .formatting import compact_json as _compact
+
+EXECUTORS = ("claude", "codex", "human")
 EVENT_KINDS = (
     "thinking",            # 思维链 / 推理
     "text",                # 普通文本输出
@@ -66,44 +68,18 @@ class GraphEdge:
 
 
 @dataclass
-class ConditionalBranch:
-
-    condition: str
-    dst: str
-
-
-@dataclass
-class ConditionalEdge:
-
-    src: str
-    branches: list[ConditionalBranch] = field(default_factory=list)
-
-
-@dataclass
 class CompiledGraph:
 
     nodes: list[SubTask] = field(default_factory=list)
     edges: list[GraphEdge] = field(default_factory=list)
-    conditional_edges: list[ConditionalEdge] = field(default_factory=list)
     entry: str = ""
     finish: str = "__end__"
-    loop: bool = False
-    loop_back_edges: list[GraphEdge] = field(default_factory=list)
-    exit_condition: str = ""
 
     def node_by_id(self, node_id: str) -> Optional[SubTask]:
         for n in self.nodes:
             if n.id == node_id:
                 return n
         return None
-
-    def successors(self, node_id: str) -> list[str]:
-        return [e.dst for e in self.edges if e.src == node_id]
-
-    @property
-    def real_node_ids(self) -> list[str]:
-        return [n.id for n in self.nodes]
-
 
 @dataclass
 class Session:
@@ -167,16 +143,6 @@ class Event:
         return f"[{self.kind}] {body}"
 
 
-def _compact(obj, width: int) -> str:
-    import json
-
-    try:
-        s = json.dumps(obj, ensure_ascii=False, default=str)
-    except Exception:
-        s = str(obj)
-    return s if len(s) <= width else s[: width - 1] + "…"
-
-
 def subtask_to_dict(t: SubTask) -> dict:
     return {
         "id": t.id,
@@ -237,15 +203,8 @@ def graph_to_dict(g: CompiledGraph) -> dict:
     return {
         "nodes": [subtask_to_dict(n) for n in g.nodes],
         "edges": [{"src": e.src, "dst": e.dst} for e in g.edges],
-        "conditional_edges": [
-            {"src": ce.src, "branches": [{"condition": b.condition, "dst": b.dst} for b in ce.branches]}
-            for ce in g.conditional_edges
-        ],
         "entry": g.entry,
         "finish": g.finish,
-        "loop": g.loop,
-        "loop_back_edges": [{"src": e.src, "dst": e.dst} for e in g.loop_back_edges],
-        "exit_condition": g.exit_condition,
     }
 
 
@@ -253,21 +212,8 @@ def graph_from_dict(d: dict) -> CompiledGraph:
     return CompiledGraph(
         nodes=[subtask_from_dict(n) for n in (d.get("nodes") or [])],
         edges=[GraphEdge(src=e.get("src", ""), dst=e.get("dst", "")) for e in (d.get("edges") or [])],
-        conditional_edges=[
-            ConditionalEdge(
-                src=ce.get("src", ""),
-                branches=[
-                    ConditionalBranch(condition=b.get("condition", ""), dst=b.get("dst", ""))
-                    for b in (ce.get("branches") or [])
-                ],
-            )
-            for ce in (d.get("conditional_edges") or [])
-        ],
         entry=d.get("entry", ""),
         finish=d.get("finish", "__end__"),
-        loop=bool(d.get("loop", False)),
-        loop_back_edges=[GraphEdge(src=e.get("src", ""), dst=e.get("dst", "")) for e in (d.get("loop_back_edges") or [])],
-        exit_condition=d.get("exit_condition", ""),
     )
 
 

@@ -3,9 +3,9 @@
 
 为什么需要它：目标机可能没网，且有些机器没装 wheel 包，导致 pip 无法离线构建。
 本脚本直接产出一个标准 wheel 文件：
-    dist/tasker-0.1.0-py3-none-any.whl
+    dist/multicc-<version>-py3-none-any.whl
 在任意 Python 3.9+ 机器上执行
-    pip install tasker-0.1.0-py3-none-any.whl
+    pip install multicc-<version>-py3-none-any.whl
 即可装出 `tasker` 命令（wheel 安装不触发构建、不需要网络）。
 
 用法：
@@ -18,6 +18,7 @@ import csv
 import hashlib
 import io
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -32,9 +33,18 @@ for _stream in (sys.stdout, sys.stderr):
 ROOT = Path(__file__).resolve().parent.parent
 PKG = ROOT / "tasker"
 DIST = ROOT / "dist"
-# 发布名（PyPI 唯一可用名；tasker/claude-codex-tasker 均被占用或不可用）
 NAME = "multicc"
-VERSION = "0.5.8"
+
+
+def _project_version() -> str:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not match:
+        raise RuntimeError("pyproject.toml 中缺少 project.version")
+    return match.group(1)
+
+
+VERSION = _project_version()
 DIST_INFO = f"{NAME}-{VERSION}.dist-info"
 
 

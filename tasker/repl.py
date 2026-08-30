@@ -28,14 +28,13 @@ REPL_HELP = """\
 
 
 class Repl:
-    def __init__(self, cfg: Config, *, planner=None, evaluator=None, judge=None, template=None):
+    def __init__(self, cfg: Config, *, planner=None, evaluator=None, template=None):
         self.cfg = cfg
         self.store = SessionStore(cfg.session)
         self.broker = ApprovalBroker(cfg.approval)
         self.session: Session | None = None
         self.planner = planner
         self.evaluator = evaluator
-        self.judge = judge
         self.template = template
         self._quit_requested = False  
 
@@ -141,7 +140,7 @@ class Repl:
 
     def _show_config(self) -> None:
         c = self.cfg
-        print(f"display.level={c.display.level}   dispatch.min_multiagent_steps={c.dispatch.min_multiagent_steps}")
+        print(f"display.level={c.display.level}   max_parallel={c.max_parallel}")
         print(f"goal_loop.max_iterations={c.goal_loop.max_iterations}   evaluator={c.goal_loop.evaluator}")
         print(f"approval.mode={c.approval.mode}")
         print(f"session.dir={c.session.path}")
@@ -160,7 +159,7 @@ class Repl:
         tui = LiveTui(think_level=think_level, display_level=self.cfg.display.level)
         loop = GoalLoop(
             self.cfg, self.broker, self.store, emit=tui.emit,
-            planner=self.planner, evaluator=self.evaluator, judge=self.judge,
+            planner=self.planner, evaluator=self.evaluator,
             template=self.template,
         )
 
@@ -174,7 +173,7 @@ class Repl:
         try:
             while th.is_alive():
                 for cmd in tui.poll_commands():
-                    self._handle_run_command(cmd, loop, tui)
+                    self._handle_command(cmd, loop, tui)
                 time.sleep(0.1)
         finally:
             tui.stop()
@@ -182,7 +181,7 @@ class Repl:
 
         self._show_final(session)
 
-    def _handle_run_command(self, cmd: dict, loop: GoalLoop, tui: LiveTui) -> None:
+    def _handle_command(self, cmd: dict, loop: GoalLoop, tui: LiveTui) -> None:
         ctype = cmd["type"]
         if ctype == "noop":
             return
@@ -207,12 +206,14 @@ class Repl:
                 console.warn("没有待处理的人工审查点")
                 return
             self.broker.resolve(req_id, allowed=True)
+            tui.release_hold()
         elif c == "reject":
             req_id = self.broker.find_pending_id(kind="review")
             if not req_id:
                 console.warn("没有待处理的人工审查点")
                 return
             self.broker.resolve(req_id, allowed=False, feedback=arg)
+            tui.release_hold()
         elif c in ("quit", "q", "exit"):
             console.warn("终止执行并退出…")
             self._quit_requested = True

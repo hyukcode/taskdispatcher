@@ -9,11 +9,9 @@ import sys
 from . import __version__
 from . import console
 from .config import load_config, save_example_config
-from .live import LiveTui
 from .llm import LLMError
 from .models import subtask_to_dict
-from .planner import plan_with_llm, plan_with_rules
-from .scheduler import Scheduler
+from .planner import _auto_match_template, plan_with_llm, plan_with_rules
 
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="tasker", description="交互式目标驱动多智能体编排器：输入目标 → 拆分 → Claude Agent SDK / Codex App Server 执行 → 直到 goal 达成")
@@ -23,16 +21,6 @@ def _make_parser() -> argparse.ArgumentParser:
 
     rp = sub.add_parser("repl", help="进入交互式 REPL（无参数默认）")
     rp.add_argument("--template", default=None, help="REPL 使用的任务拆解模板名称或 JSON 文件路径")
-
-    r = sub.add_parser("run", help="交互式运行")
-    r.add_argument("prompt", nargs="?", default="")
-    r.add_argument("--plan-rules", action="store_true", help="用规则拆分，不调用 LLM")
-    r.add_argument("--think", choices=["full", "head", "off"], default="full", help="思维链输出：full 完整（默认）/ head 截断 / off 隐藏")
-    r.add_argument("--no-input", action="store_true", help="关闭交互输入（仅流式输出）")
-    r.add_argument("--report", action="store_true", help="结束后额外写一份 Markdown 报告")
-    r.add_argument("--max-parallel", type=int, default=None)
-    r.add_argument("--timeout", type=float, default=None, help="单任务超时秒数")
-    r.add_argument("--template", default=None, help="任务拆解模板名称（从 tasker-template 模板库查找，也兼容文件路径）")
 
     pl = sub.add_parser("plan", help="打印拆分计划")
     pl.add_argument("prompt", nargs="?", default="")
@@ -63,53 +51,6 @@ def cmd_repl(args, cfg) -> int:
     return main_loop(cfg, template=template)
 
 
-def cmd_run(args, cfg) -> int:
-    prompt = _read_prompt(args.prompt)
-    if not prompt:
-        console.error("没有输入 prompt")
-        return 2
-
-    overrides = {}
-    if args.max_parallel:
-        overrides["max_parallel"] = args.max_parallel
-    if args.timeout:
-        overrides["timeout_per_task"] = args.timeout
-    cfg = load_config(args.config, overrides=overrides)
-
-    tui = LiveTui(
-        think_level=args.think,
-        display_level=cfg.display.level,
-        input_enabled=not args.no_input,
-    )
-
-    template = _load_template(args.template) if args.template else _auto_match_template(prompt)
-    if args.plan_rules:
-        plan = plan_with_rules(prompt, template=template)
-    else:
-        try:
-            plan = plan_with_llm(prompt, cfg, emit=lambda e: tui.emit(None, e, "planner"), template=template)  # type: ignore[arg-type]
-        except LLMError as e:
-            console.warn(f"任务拆分 LLM 不可用（{e}），回退到规则拆分")
-            plan = plan_with_rules(prompt, template=template)
-
-    sched = Scheduler(cfg, prompt, plan, tui)
-    runs = sched.run()
-
-    console.banner("汇总")
-    total_cost = sum(r.cost_usd for r in runs)
-    for r in runs:
-        mark = "✓" if r.status == "success" else "✗"
-        print(f"  {mark} {r.task.id} [{r.task.executor}] {r.status:<9} {r.duration:6.1f}s  ${r.cost_usd:.4f}")
-    print(f"  合计成本: ${total_cost:.4f}")
-
-    if args.report:
-        from .report import write_report
-
-        path = write_report(plan, runs, prompt, cfg.report_path)
-        console.ok(f"报告已写入 {path}")
-    return 0 if all(r.status == "success" for r in runs) else 1
-
-
 def _load_template(name: str) -> dict | None:
 
     import os
@@ -118,12 +59,10 @@ def _load_template(name: str) -> dict | None:
         return _load_template_from_file(name)
 
     try:
-        from template import get_template
+        from .template_compiler import load_named_template
 
-        tpl = get_template(name)
+        tpl = load_named_template(name)
         if tpl:
-            tpl = dict(tpl)
-            tpl.pop("_meta", None)
             return tpl
         console.warn(f"模板库中未找到模板: {name}")
         return None
@@ -137,7 +76,6 @@ def _load_template(name: str) -> dict | None:
 
 def _load_template_from_file(path: str) -> dict | None:
 
-    import os as _os
     from pathlib import Path
 
     p = Path(path).expanduser().resolve()
@@ -212,35 +150,6 @@ def _load_template_from_file(path: str) -> dict | None:
         return None
 
 
-def _auto_match_template(prompt: str) -> dict | None:
-
-    try:
-        from template import search_templates, get_template
-    except ImportError:
-        return None
-
-    import re
-
-    keywords = set()
-    for m in re.finditer(r"[a-zA-Z]{3,}", prompt):
-        keywords.add(m.group().lower())
-
-    if not keywords:
-        return None
-
-    seen: set[str] = set()
-    for kw in keywords:
-        results = search_templates(keyword=kw)
-        for info in results or []:
-            name = info.get("name", "")
-            if name and name not in seen:
-                seen.add(name)
-                tpl = get_template(name)
-                if tpl:
-                    return tpl
-    return None
-
-
 def cmd_plan(args, cfg) -> int:
     prompt = _read_prompt(args.prompt)
     template = _load_template(args.template) if args.template else _auto_match_template(prompt)
@@ -279,7 +188,9 @@ def cmd_verify(args, cfg) -> int:
 
     from .llm import check_key
 
-    claude_ok = bool(shutil.which(cfg.claude.binary) or shutil.which(cfg.claude.binary.split()[0]))
+    import importlib.util
+
+    claude_ok = importlib.util.find_spec("claude_agent_sdk") is not None
     codex_ok = bool(shutil.which(cfg.codex.binary) or shutil.which(cfg.codex.binary.split()[0]))
     key_ok, key_note = check_key(cfg.llm)
     results = {"claude": claude_ok, "codex": codex_ok, "llm_key": key_ok, "llm_note": key_note}
@@ -320,8 +231,6 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command is None or args.command == "repl":
             return cmd_repl(args, cfg)
-        if args.command == "run":
-            return cmd_run(args, cfg)
         if args.command == "plan":
             return cmd_plan(args, cfg)
         if args.command == "verify-config":

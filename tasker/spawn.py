@@ -6,6 +6,7 @@ import queue
 import shutil
 import subprocess
 import threading
+from collections import deque
 from typing import Optional
 
 
@@ -20,24 +21,41 @@ def resolve_binary(name: str) -> str:
 
 class ProcChannel:
 
-    def __init__(self, proc: subprocess.Popen, name: str = ""):
+    def __init__(self, proc: subprocess.Popen, name: str = "", stderr_limit: int = 200):
         self.proc = proc
         self.name = name
         self._lines: "queue.Queue[str | None]" = queue.Queue()
-        self._eof = threading.Event()
+        self._stderr_tail: deque[str] = deque(maxlen=max(1, stderr_limit))
+        self._stderr_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._reader = threading.Thread(target=self._read_loop, daemon=True, name=f"stdout-{name or 'proc'}")
+        self._stderr_reader = threading.Thread(
+            target=self._stderr_loop,
+            daemon=True,
+            name=f"stderr-{name or 'proc'}",
+        )
         self._reader.start()
+        self._stderr_reader.start()
 
     def _read_loop(self) -> None:
         try:
-            for line in self.proc.stdout:
-                self._lines.put(line)
+            if self.proc.stdout is not None:
+                for line in self.proc.stdout:
+                    self._lines.put(line)
         except Exception:
             pass
         finally:
             self._lines.put(None)
-            self._eof.set()
+
+    def _stderr_loop(self) -> None:
+        """持续消费 stderr，避免子进程因 stderr 缓冲区满而阻塞。"""
+        try:
+            if self.proc.stderr is not None:
+                for line in self.proc.stderr:
+                    with self._stderr_lock:
+                        self._stderr_tail.append(line.rstrip("\r\n"))
+        except Exception:
+            pass
 
     def next_line(self, timeout: float = 0.2) -> Optional[str]:
         try:
@@ -74,6 +92,12 @@ class ProcChannel:
     def is_alive(self) -> bool:
         return self.proc.poll() is None
 
+    @property
+    def stderr_tail(self) -> str:
+        """返回最近的 stderr，长度受 ``stderr_limit`` 限制。"""
+        with self._stderr_lock:
+            return "\n".join(self._stderr_tail)
+
     def stop(self) -> None:
         self.close_stdin()
         try:
@@ -88,6 +112,13 @@ class ProcChannel:
                 self.proc.kill()
             except Exception:
                 pass
+            try:
+                self.proc.wait(timeout=2)
+            except Exception:
+                pass
+        for reader in (self._reader, self._stderr_reader):
+            if reader.is_alive() and reader is not threading.current_thread():
+                reader.join(timeout=0.5)
 
 
 def start_process(
@@ -97,7 +128,9 @@ def start_process(
     name: str = "",
     env: dict[str, str] | None = None,
 ) -> ProcChannel:
-    resolved = [cmd[0]] + list(cmd[1:])
+    if not cmd:
+        raise ValueError("无法启动空的进程命令")
+    resolved = list(cmd)
     full_env = dict(os.environ)
     if env:
         full_env.update(env)

@@ -23,13 +23,11 @@ class LLMConfig:
 
 @dataclass
 class ClaudeConfig:
-    binary: str = "claude"
     model: str = ""
     permission_mode: str = "acceptEdits"
     allowed_tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
     completion_idle: float = 5.0
-    extra_args: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -56,7 +54,6 @@ class ApprovalConfig:
 class DispatchConfig:
     """任务分派策略。"""
 
-    min_multiagent_steps: int = 3
     strategy: str = "codex-first-review"
     complex_executor: str = "codex"
     implementation_executor: str = "claude"
@@ -110,20 +107,8 @@ class Config:
     template_compiler: TemplateCompilerConfig = field(default_factory=TemplateCompilerConfig)
     display: DisplayConfig = field(default_factory=DisplayConfig)
     session: SessionConfig = field(default_factory=SessionConfig)
-    workspace_dir: str = "workspaces"
-    report_dir: str = "reports"
     max_parallel: int = 2
     timeout_per_task: float = 900.0
-
-    @property
-    def workspace_path(self) -> Path:
-        p = Path(self.workspace_dir)
-        return p if p.is_absolute() else Path.cwd() / p
-
-    @property
-    def report_path(self) -> Path:
-        p = Path(self.report_dir)
-        return p if p.is_absolute() else Path.cwd() / p
 
 
 def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
@@ -140,13 +125,11 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
 
     if "claude" in data:
         d = data["claude"]
-        cfg.claude.binary = d.get("binary", cfg.claude.binary)
         cfg.claude.model = d.get("model", cfg.claude.model)
         cfg.claude.permission_mode = d.get("permission_mode", cfg.claude.permission_mode)
         cfg.claude.allowed_tools = d.get("allowed_tools", cfg.claude.allowed_tools)
         cfg.claude.disallowed_tools = d.get("disallowed_tools", cfg.claude.disallowed_tools)
         cfg.claude.completion_idle = float(d.get("completion_idle", cfg.claude.completion_idle))
-        cfg.claude.extra_args = d.get("extra_args", cfg.claude.extra_args)
 
     if "codex" in data:
         d = data["codex"]
@@ -165,7 +148,6 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
 
     if "dispatch" in data:
         d = data["dispatch"]
-        cfg.dispatch.min_multiagent_steps = int(d.get("min_multiagent_steps", cfg.dispatch.min_multiagent_steps))
         cfg.dispatch.strategy = d.get("strategy", cfg.dispatch.strategy)
         cfg.dispatch.complex_executor = d.get("complex_executor", cfg.dispatch.complex_executor)
         cfg.dispatch.implementation_executor = d.get("implementation_executor", cfg.dispatch.implementation_executor)
@@ -192,8 +174,6 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
         cfg.session.dir = d.get("dir", cfg.session.dir)
         cfg.session.workspace_dir = d.get("workspace_dir", cfg.session.workspace_dir)
 
-    cfg.workspace_dir = data.get("workspace_dir", cfg.workspace_dir)
-    cfg.report_dir = data.get("report_dir", cfg.report_dir)
     cfg.max_parallel = int(data.get("max_parallel", cfg.max_parallel))
     cfg.timeout_per_task = float(data.get("timeout_per_task", cfg.timeout_per_task))
     return cfg
@@ -233,12 +213,10 @@ def save_example_config(path: str | Path) -> None:
             "timeout": 120,
         },
         "claude": {
-            "binary": "claude",
             "model": "",
             "permission_mode": "default",
             "allowed_tools": [],
             "disallowed_tools": [],
-            "extra_args": [],
         },
         "codex": {
             "binary": "codex",
@@ -250,7 +228,6 @@ def save_example_config(path: str | Path) -> None:
         },
         "approval": {"mode": "auto", "default_allow": True, "timeout": 120},
         "dispatch": {
-            "min_multiagent_steps": 3,
             "strategy": "codex-first-review",
             "complex_executor": "codex",
             "implementation_executor": "claude",
@@ -262,8 +239,6 @@ def save_example_config(path: str | Path) -> None:
         "template_compiler": {"loop_infer": "llm", "cache": True},
         "display": {"level": "minimal"},
         "session": {"dir": "~/.tasker/sessions", "workspace_dir": "~/.tasker/workspace"},
-        "workspace_dir": "workspaces",
-        "report_dir": "reports",
         "max_parallel": 2,
         "timeout_per_task": 900,
     }

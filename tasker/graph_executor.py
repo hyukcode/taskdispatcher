@@ -4,48 +4,15 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from . import console
 from .approvals import ApprovalBroker
-from .codex_app_server_runner import CodexAppServerRunner
 from .config import Config
-from .llm import chat
 from .models import CompiledGraph, Event, SubTask, TaskRun
-from .planner import _extract_json
-from .sdk_runner import SdkClaudeRunner
-
-EXECUTOR_TO_RUNNER = {"claude": SdkClaudeRunner, "codex": CodexAppServerRunner}
-
-DEFAULT_MAX_LOOP_ITERATIONS = 5
-
-JUDGE_PROMPT = """\
-你是一个条件判定器。给你一个「退出条件」（自然语言）和当前任务的执行上下文，
-请判断该退出条件当前是否已经满足。
-
-严格只输出 JSON（不要 markdown 代码块）：
-{"satisfied": true, "feedback": "……"}
-
-- satisfied=true 表示条件已满足，可以退出循环继续往后。
-- satisfied=false 时 feedback 写清「哪里不满足、需要怎么改」，该反馈会注回上游节点重跑。
-"""
-
-
-def llm_judge_condition(cfg: Config, condition: str, context: str) -> dict:
-    try:
-        raw = chat(
-            cfg.llm,
-            [
-                {"role": "system", "content": JUDGE_PROMPT},
-                {"role": "user", "content": f"退出条件：\n{condition}\n\n当前上下文：\n{context[:8000]}"},
-            ],
-            temperature=0.0,
-        )
-        data = _extract_json(raw)
-        return {"satisfied": bool(data.get("satisfied", False)), "feedback": str(data.get("feedback", ""))}
-    except Exception as e:  # noqa: BLE001
-        console.warn(f"loop 退出条件判定 LLM 失败（{e}），按未满足处理")
-        return {"satisfied": False, "feedback": f"（条件判定不可用：{e}）"}
+from .runner_base import RunnerBase
+from .runner_factory import create_runner
 
 
 def _topo_layers(nodes: list[SubTask], edges) -> list[list[SubTask]]:
@@ -62,7 +29,7 @@ def _topo_layers(nodes: list[SubTask], edges) -> list[list[SubTask]]:
     while remaining:
         ready = sorted(nid for nid, d in remaining.items() if d == 0)
         if not ready:
-            ready = [sorted(remaining)[0]]
+            raise ValueError("任务依赖存在环，无法执行")
         layers.append([by_id[nid] for nid in ready])
         for nid in ready:
             remaining.pop(nid, None)
@@ -83,8 +50,6 @@ class GraphExecutor:
         emit=None,
         goal: str = "",
         state: dict | None = None,
-        judge=None,
-        max_loop_iterations: int = DEFAULT_MAX_LOOP_ITERATIONS,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -92,13 +57,12 @@ class GraphExecutor:
         self.workdir = Path(workdir)
         self.emit = emit or self._default_emit
         self.goal = goal
-        self.state = state or {}
-        self.judge = judge or llm_judge_condition
-        self.max_loop_iterations = max_loop_iterations
+        self.state = state if state is not None else {}
+        self.workdir.mkdir(parents=True, exist_ok=True)
 
         self.runs: dict[str, TaskRun] = {}
         self._quit = threading.Event()
-        self._active: dict[str, tuple] = {}
+        self._active: dict[str, RunnerBase] = {}
         self._active_lock = threading.Lock()
 
     @staticmethod
@@ -115,13 +79,15 @@ class GraphExecutor:
             self._execute_dag()
         finally:
             self._quit.set()
-        return list(self.runs.values())
+            if self._active:
+                self.stop()
+        return [self.runs[node.id] for node in self.graph.nodes if node.id in self.runs]
 
     def stop(self) -> None:
         self._quit.set()
         with self._active_lock:
             runners = list(self._active.values())
-        for runner, _ in runners:
+        for runner in runners:
             runner.stop()
 
     def send_message(self, target: str, text: str) -> list[str]:
@@ -130,7 +96,7 @@ class GraphExecutor:
         matched: list[str] = []
         with self._active_lock:
             items = list(self._active.items())
-        for nid, (runner, _) in items:
+        for nid, runner in items:
             task = self.runs[nid].task if nid in self.runs else None
             if task is None:
                 continue
@@ -167,28 +133,14 @@ class GraphExecutor:
             self._run_human_with_rerun(node)
 
     def _run_code_nodes_parallel(self, nodes: list[SubTask]) -> None:
-        threads = [
-            threading.Thread(target=self._run_code_node, args=(node, ""), daemon=True, name=f"node-{node.id}")
-            for node in nodes
-        ]
-        for th in threads:
-            th.start()
-        for th in threads:
-            th.join()
-
-    def _execute_with_loop(self) -> None:
-        """兼容旧调用者：旧图级 loop 也按普通 DAG 执行，避免整图重跑。"""
-        self._execute_dag()
-
-    def _run_node_single(self, node: SubTask, extra_context: str = "") -> None:
-        blocked = self._blocked_predecessors(node.id)
-        if blocked:
-            self._skip_node(node, blocked)
-            return
-        if node.executor == "human":
-            self._run_human_with_rerun(node)
-        else:
-            self._run_code_node(node, extra_context)
+        try:
+            max_workers = max(1, int(getattr(self.cfg, "max_parallel", 1)))
+        except (TypeError, ValueError):
+            max_workers = 1
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="node") as pool:
+            futures = [pool.submit(self._run_code_node, node, "") for node in nodes]
+            for future in futures:
+                future.result()
 
     def _blocked_predecessors(self, node_id: str) -> list[str]:
         blocked: list[str] = []
@@ -210,19 +162,26 @@ class GraphExecutor:
         run = TaskRun(task=node, workdir=workdir)
         self.runs[node.id] = run
 
-        runner_cls = EXECUTOR_TO_RUNNER.get(node.executor)
-        if runner_cls is None:
+        try:
+            runner = create_runner(
+                node.executor,
+                self.cfg,
+                run,
+                workdir,
+                self._emit,
+                self._prompt_for(node, extra_context),
+                broker=self.broker,
+            )
+        except ValueError as exc:
             run.status = "failed"
-            run.error = f"未知 executor: {node.executor}"
+            run.error = str(exc)
             self._emit(run, Event(kind="error", source=node.executor, text=run.error))
             return run
 
-        prompt = self._prompt_for(node, extra_context)
-        runner = runner_cls(self.cfg, run, workdir, self._emit, prompt, broker=self.broker)
-        if node.internal_loop is not None and hasattr(runner, "set_internal_loop"):
+        if node.internal_loop is not None:
             runner.set_internal_loop(node.internal_loop)
         with self._active_lock:
-            self._active[node.id] = (runner, threading.current_thread())
+            self._active[node.id] = runner
         console.status_line("▶", f"启动 {node.id} [{node.executor}] {node.title}", "blue")
         if node.description:
             console.dim(f"   任务: {node.description.strip().splitlines()[0][:120]}")
@@ -317,11 +276,17 @@ class GraphExecutor:
             preds = self._predecessors(node.id)
             if not preds:
                 console.warn(f"审查点 {node.id} 被驳回，但没有可重跑的上游节点，跳过重跑")
+                return
+            rerun = False
             for pid in preds:
                 pred = self.graph.node_by_id(pid)
                 if pred is not None and pred.executor != "human":
+                    rerun = True
                     console.status_line("↩", f"审查驳回，重跑上游 {pred.id} [{pred.executor}]", "yellow")
                     self._run_code_node(pred, extra_context=f"[审查驳回反馈] {feedback}\n请据此修改后再执行。")
+            if not rerun:
+                console.warn(f"审查点 {node.id} 被驳回，但没有可重跑的代码上游节点，跳过重跑")
+                return
 
     def _run_human_node(self, node: SubTask) -> dict:
         req_id = f"review-{node.id}-{int(time.time() * 1000)}"

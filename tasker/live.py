@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import re
 import sys
 import threading
 
 from . import console
+from .formatting import compact_json
 from .models import Event, TaskRun
-
-CMDS = ("help", "status", "plan", "allow", "deny", "approve", "reject", "pause", "resume", "done", "quit", "q", "exit", "attach")
 
 HELP = """\
 输入指令（agent 运行期间随时可用）：
@@ -79,9 +79,59 @@ def parse_input_line(raw: str) -> dict:
 _raw_buf = b""
 
 
+class TerminalSession:
+    """管理一次交互式终端会话的 raw mode 生命周期。"""
+
+    def __init__(self):
+        self._saved_attrs = None
+        self._active = False
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            return bool(sys.stdin.isatty() and sys.stdout.isatty())
+        except Exception:
+            return False
+
+    def start(self) -> bool:
+        global _raw_buf
+        _raw_buf = b""
+        if not self.available():
+            return False
+        if os.name == "nt":
+            return True
+
+        import termios
+        import tty
+
+        try:
+            fd = sys.stdin.fileno()
+            self._saved_attrs = termios.tcgetattr(fd)
+            tty.setraw(fd)
+            self._active = True
+        except Exception:
+            self._saved_attrs = None
+        return self._active or os.name == "nt"
+
+    def stop(self) -> None:
+        if not self._active or self._saved_attrs is None:
+            return
+        import termios
+
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved_attrs)
+        except Exception:
+            pass
+        finally:
+            self._active = False
+            self._saved_attrs = None
+
+
 def _raw_char() -> str:
     if sys.platform == "win32":
         import msvcrt
+        if not msvcrt.kbhit():
+            return ""
         try:
             ch = msvcrt.getwch()
         except UnicodeDecodeError:
@@ -99,14 +149,17 @@ def _raw_char() -> str:
 
 def _raw_char_unix() -> str:
     global _raw_buf
-    import os
+    import select
+
     fd = sys.stdin.fileno()
     try:
+        if not select.select([fd], [], [], 0.1)[0]:
+            return ""
         b = os.read(fd, 1)
     except Exception:
         return ""
     if not b:
-        return ""
+        return "\x04"
     _raw_buf += b
     try:
         ch = _raw_buf.decode("utf-8")
@@ -120,7 +173,6 @@ def _raw_char_unix() -> str:
 
 
 def _drain_esc_seq() -> None:
-    import os
     import select
     fd = sys.stdin.fileno()
     try:
@@ -128,38 +180,6 @@ def _drain_esc_seq() -> None:
             os.read(fd, 1)
     except Exception:
         pass
-
-
-def _raw_start() -> None:
-    global _raw_buf
-    _raw_buf = b""
-    if sys.platform == "win32":
-        return
-    if not sys.stdin.isatty():
-        return
-    import atexit
-    import termios
-    import tty
-    fd = sys.stdin.fileno()
-    try:
-        _raw_start._saved = termios.tcgetattr(fd)
-    except Exception:
-        _raw_start._saved = None 
-    if _raw_start._saved: 
-        tty.setraw(fd)
-        atexit.register(_raw_stop)
-
-
-def _raw_stop() -> None:
-    if sys.platform == "win32":
-        return
-    import termios
-    saved = getattr(_raw_start, "_saved", None)
-    if saved:
-        try:
-            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, saved)
-        except Exception:
-            pass
 
 
 class LiveTui:
@@ -180,13 +200,39 @@ class LiveTui:
         self._event_counts: dict[str, int] = {}
         self._input_buf = ""
         self._prompt = "> "
+        self._terminal = TerminalSession()
+        self._interactive = False
+        self._output_hook = None
+        self._previous_output_hook = None
+        self._renderers = {
+            "thinking": self._emit_thinking_locked,
+            "tool_use": self._emit_tool_use_locked,
+            "tool_result": self._emit_tool_result_locked,
+            "permission_request": self._emit_permission_request_locked,
+            "permission_result": self._emit_permission_result_locked,
+            "review_request": self._emit_review_request_locked,
+            "review_result": self._emit_review_result_locked,
+            "text": self._emit_text_locked,
+            "user_message": self._emit_user_message_locked,
+            "error": self._emit_error_locked,
+            "result": self._emit_result_locked,
+            "interaction": self._emit_interaction_locked,
+            "usage": self._emit_usage_locked,
+            "system": self._emit_system_locked,
+            "raw": self._emit_raw_locked,
+        }
 
     def start(self) -> None:
-        if not self.input_enabled or self._started:
+        if self._started:
             return
         self._started = True
-        _raw_start()
-        console._write_hook = self._console_hook
+        if not self.input_enabled:
+            return
+        self._interactive = self._terminal.start()
+        if not self._interactive:
+            return
+        self._output_hook = self._console_hook
+        self._previous_output_hook = console.set_output_hook(self._output_hook)
         self.print_raw(console.paint("▶ 输入 :help 查看指令。审批时用 :allow / :deny 决定。", "dim"))
         self._input_thread = threading.Thread(target=self._read_loop, daemon=True, name="tui-input")
         self._input_thread.start()
@@ -218,6 +264,7 @@ class LiveTui:
                     self._cmds.put({"type": "cmd", "cmd": "quit", "arg": ""})
                     self._input_buf = ""
                     self._redraw()
+                    self._stop.set()
                     break
                 elif ch >= " " or ch == "\t":
                     self._input_buf += ch
@@ -246,6 +293,7 @@ class LiveTui:
     def poll_commands(self, timeout: float = 0.1) -> list[dict]:
         out: list[dict] = []
         try:
+            out.append(self._cmds.get(timeout=max(0.0, timeout)))
             while True:
                 out.append(self._cmds.get_nowait())
         except queue.Empty:
@@ -254,14 +302,18 @@ class LiveTui:
 
     # ---------- 审批抑制 ----------
     def hold_for_approval(self) -> None:
-        if not self._hold.is_set():
-            self._hold.set()
-            self.print_raw("")
-            self.print_raw(console.paint(APPROVAL_BANNER, "bold", "yellow"))
-            self.print_raw("")
+        with self._print_lock:
+            self._hold_for_approval_locked()
+
+    def _hold_for_approval_locked(self) -> None:
+        if self._hold.is_set():
+            return
+        self._hold.set()
+        self._write_locked("\n" + console.paint(APPROVAL_BANNER, "bold", "yellow") + "\n")
 
     def release_hold(self) -> None:
-        self._hold.clear()
+        with self._print_lock:
+            self._hold.clear()
 
     @property
     def is_held(self) -> bool:
@@ -281,7 +333,7 @@ class LiveTui:
         sys.stdout.write(f"\r{self._prompt}{self._input_buf}")
         sys.stdout.flush()
 
-    def emit(self, run: TaskRun, event: Event, source_tag: str = "") -> None:
+    def emit(self, run: TaskRun | None, event: Event, source_tag: str = "") -> None:
         tag = source_tag or event.source
         kind = event.kind
 
@@ -301,41 +353,41 @@ class LiveTui:
         if not visible:
             return
 
+        if not self._interactive:
+            with self._print_lock:
+                self._event_counts[kind] = self._event_counts.get(kind, 0) + 1
+                console.event_line(event.summary(), source=tag)
+            return
+
         with self._print_lock:
             self._event_counts[kind] = self._event_counts.get(kind, 0) + 1
+            if kind in ("permission_request", "review_request") and not event.data.get("auto"):
+                self._hold_for_approval_locked()
+            elif kind in ("permission_result", "review_result"):
+                self._hold.clear()
+            renderer = self._renderers.get(kind, self._emit_generic_locked)
+            renderer(tag, event)
 
-            if kind == "thinking":
-                self._emit_thinking_locked(tag, event)
-            elif kind == "tool_use":
-                self._emit_tool_use_locked(tag, event)
-            elif kind == "tool_result":
-                self._emit_tool_result_locked(tag, event)
-            elif kind == "permission_request":
-                self._emit_permission_request_locked(tag, event)
-            elif kind == "permission_result":
-                self._emit_permission_result_locked(tag, event)
-            elif kind == "review_request":
-                self._emit_review_request_locked(tag, event)
-            elif kind == "review_result":
-                self._emit_review_result_locked(tag, event)
-            elif kind == "text":
-                self._emit_text_locked(tag, event)
-            elif kind == "user_message":
-                self._write_locked(console.paint(f"[{tag}] 👤 {event.text}", "cyan"))
-            elif kind == "error":
-                self._write_locked(console.paint(f"[{tag}] ❌ {event.text}", "red"))
-            elif kind == "result":
-                self._write_locked(console.paint(f"[{tag}] 🏁 {_truncate(event.text, 200)}", "green"))
-            elif kind == "interaction":
-                self._write_locked(console.paint(f"[{tag}] 🔁 {event.text}", "magenta"))
-            elif kind == "usage":
-                self._emit_usage_locked(tag, event)
-            elif kind == "system":
-                self._write_locked(console.paint(f"[{tag}] ⚙ {event.text}", "dim"))
-            elif kind == "raw":
-                self._write_locked(console.paint(f"[{tag}] 🧪 {event.text[:120]}", "dim"))
-            else:
-                self._write_locked(f"[{tag}] [{kind}] {event.text[:120]}")
+    def _emit_user_message_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(console.paint(f"[{tag}] 👤 {event.text}", "cyan"))
+
+    def _emit_error_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(console.paint(f"[{tag}] ❌ {event.text}", "red"))
+
+    def _emit_result_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(console.paint(f"[{tag}] 🏁 {_truncate(event.text, 200)}", "green"))
+
+    def _emit_interaction_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(console.paint(f"[{tag}] 🔁 {event.text}", "magenta"))
+
+    def _emit_system_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(console.paint(f"[{tag}] ⚙ {event.text}", "dim"))
+
+    def _emit_raw_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(console.paint(f"[{tag}] 🧪 {event.text[:120]}", "dim"))
+
+    def _emit_generic_locked(self, tag: str, event: Event) -> None:
+        self._write_locked(f"[{tag}] [{event.kind}] {event.text[:120]}")
 
     def _emit_thinking_locked(self, tag: str, event: Event) -> None:
         if self.think_level == "off":
@@ -425,8 +477,12 @@ class LiveTui:
 
     def stop(self) -> None:
         self._stop.set()
-        _raw_stop()
-        console._write_hook = None
+        self._terminal.stop()
+        if self._output_hook is not None:
+            console.restore_output_hook(self._output_hook, self._previous_output_hook)
+            self._output_hook = None
+            self._previous_output_hook = None
+        self._interactive = False
         if self._input_thread and self._input_thread.is_alive():
             self._input_thread.join(timeout=1.0)
 
@@ -445,8 +501,6 @@ def _oneliner(text: str) -> str:
 
 
 def _fmt_tool_input_compact(inp) -> str:
-    import json
-
     if isinstance(inp, str):
         return _truncate(inp, 100)
     if isinstance(inp, dict):
@@ -463,20 +517,4 @@ def _fmt_tool_input_compact(inp) -> str:
         if not keys:
             keys = [f"{k}=…" for k in list(inp.keys())[:2]]
         return ", ".join(keys)[:100]
-    try:
-        s = json.dumps(inp, ensure_ascii=False, default=str)
-        return _truncate(s, 100)
-    except Exception:
-        return _truncate(str(inp), 100)
-
-
-def _fmt_tool_input(inp) -> str:
-    import json
-
-    if isinstance(inp, str):
-        return inp if len(inp) <= 4000 else inp[:4000] + "\n…（已截断）"
-    try:
-        s = json.dumps(inp, ensure_ascii=False, indent=2, default=str)
-    except Exception:
-        s = str(inp)
-    return s if len(s) <= 4000 else s[:4000] + "\n…（已截断）"
+    return _truncate(compact_json(inp, 100), 100)

@@ -18,7 +18,7 @@
 发布后，任意目标机：
   pip install multicc
 或指定版本：
-  pip install multicc==0.1.0
+pip install multicc==0.6.1
 升级：
   pip install -U multicc
 """

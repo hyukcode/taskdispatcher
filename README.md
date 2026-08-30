@@ -17,7 +17,6 @@
 | 💬 中途修改 | 运行中 `@claude/@codex/@all <消息>` 注入当前 SDK / App Server 会话 |
 | 🎯 依赖编排 | LLM 拆出依赖图 → 分层并发；上游输出自动作为下游上下文 |
 | 🧭 规则拆分 | `--plan-rules` 可跳过任务拆分 LLM，直接生成执行计划 |
-| 📋 报告 | 可选 `--report` 落一份完整 Markdown 轨迹 |
 
 ---
 
@@ -46,11 +45,8 @@ Python ≥ 3.9。完整打包 / 发布说明见 [RELEASE.md](RELEASE.md)。
 ## 快速开始
 
 ```bash
-# 真实运行（LLM 拆分 → claude/codex 执行 → CLI 实时输出）
-python -m tasker run "写一个 Python CLI 工具，带子命令，并补上单元测试"
-
-# 规则拆分（不用 LLM 也能跑，适合快速试）
-python -m tasker run "实现一个斐波那契脚本" --plan-rules
+# 进入 REPL（LLM 拆分 → claude/codex 执行 → CLI 实时输出）
+python -m tasker repl
 
 # 只打印计划
 python -m tasker plan "重构这个项目" --json
@@ -86,15 +82,17 @@ prompt
 planner ──► Plan {tasks[], depends_on[], executor: claude|codex}
   │            │  (规则拆分 plan_with_rules 作为无 key 回退)
   ▼
-scheduler（按依赖分层，max_parallel 并发）
-  ├─► SdkClaudeRunner ─► Claude Agent SDK 会话
-  │        │             SDK query → receive_response → @all/@claude 注入
-  │        ▼
-  │     消息: System / Assistant / User / Result + blocks
-  ├─► CodexAppServerRunner ─► codex app-server（JSON-RPC）
-  │        │             approval_request / tool_call / reasoning / completed
-  │        ▼
-  └─► 每个事件 → LiveTui 实时打印 + 写入 workspaces/<run>/<task>.events.jsonl
+ GoalLoop（外层 goal 收敛）
+   └─► GraphExecutor（按依赖分层，max_parallel 并发）
+        ├─► SdkClaudeRunner ─► Claude Agent SDK 会话
+        │        │             SDK query → receive_response → @all/@claude 注入
+        │        ▼
+        │     消息: System / Assistant / User / Result + blocks
+        ├─► CodexAppServerRunner ─► codex app-server（JSON-RPC）
+        │        │             approval_request / tool_call / reasoning / completed
+        │        ▼
+        └─► 所有任务共享 ~/.tasker/workspace/<session_id>
+             事件写入 ~/.tasker/sessions/<session_id>/events/<task>.events.jsonl
             │
             ▼
       用户在终端输入 → 输入线程 → 路由给对应 runner
@@ -107,14 +105,16 @@ scheduler（按依赖分层，max_parallel 并发）
 
 ```
 tasker/
-  main.py          CLI 入口（run / plan / verify-config / init）
-  scheduler.py     依赖分层、并发、用户输入路由、审批策略接线
+  main.py          CLI 入口（repl / plan / verify-config / init）
+  repl.py          REPL、session 生命周期和运行中输入路由
+  goal_loop.py     外层 goal loop 与 session workspace
+  graph_executor.py 依赖分层、并发、任务生命周期和审批接线
   planner.py       LLM 拆分 + 规则回退 + 依赖校验/环检测
   sdk_runner.py    Claude Agent SDK 事件采集 + 会话注入 + 完成判定
   codex_app_server_runner.py  Codex App Server 事件采集 + thread/turn 注入
   live.py          LiveTui：实时打印 + 后台输入线程 + 指令解析
   approvals.py     审批策略（auto / log / ask_console）
-  llm.py / config.py / spawn.py / models.py / console.py / report.py
+  llm.py / config.py / spawn.py / models.py / console.py
 ```
 
 ---
@@ -132,6 +132,7 @@ tasker/
 | `claude` | `completion_idle` | `5.0` | 最终 result 后无活动秒数 → 关闭 stdin 收尾 |
 | `codex` | `sandbox` | `workspace-write` | `read-only` / `workspace-write` / `danger-full-access` |
 | `codex` | `approval_policy` | `on-request` | Codex App Server 的审批策略 |
+| `session` | `workspace_dir` | `~/.tasker/workspace` | 同一 session 下所有任务共享的工作目录 |
 | `display` | `level` | `minimal` | `minimal` 核心事件；`verbose` 详情；`debug` 原始协议事件 |
 | `approval` | `mode` | `auto` | `auto` / `log` / `ask_console` |
 | `approval` | `default_allow` | `true` | auto 模式的默认决定 |
@@ -161,7 +162,7 @@ tasker/
 `llm` 段用独立 API key。若你的 `ANTHROPIC_API_KEY` 是 Claude Code 网关专用 key，无法直接访问 api.anthropic.com —— 设 `llm.base_url` 指向你的网关，或换 `provider=openai` + DeepSeek/Ollama。任何失败都会自动回退到规则拆分。
 
 **headless 下"审批请求"不弹窗？**
-审批请求会进入 Tasker 的统一事件流；`approval.mode=ask_console` 时，在当前 REPL/run 终端输入 `:allow` 或 `:deny`。
+审批请求会进入 Tasker 的统一事件流；`approval.mode=ask_console` 时，在当前 REPL 终端输入 `:allow` 或 `:deny`。
 
 **运行卡住不结束？**
 执行器发完最终结果后，Tasker 根据 `result` / `turn/completed` 和 `completion_idle` 收尾；可 `:done` 手动收尾。
