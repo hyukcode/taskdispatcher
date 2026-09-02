@@ -29,6 +29,7 @@ HELP = """\
   :reject <反馈>       人工审查点：驳回（反馈注回上游重跑）
   :status              打印各任务进度、耗时和注入计数
   :plan                重新打印计划
+  :stop /stop          中止当前任务并返回 tasker>（可用 /continue 继续）
   :continue            执行中无操作；结束后在 tasker> 下继续会话
   :new / :restart      执行中不可切换；结束后在 tasker> 下使用对应命令
   :pause / :resume     暂停输入转发 / 恢复
@@ -71,6 +72,8 @@ def parse_input_line(raw: str) -> dict:
         cmd = (parts[0] or "").lower()
         arg = parts[1].strip() if len(parts) > 1 else ""
         return {"type": "cmd", "cmd": cmd, "arg": arg}
+    if s.lower() == "/stop":
+        return {"type": "cmd", "cmd": "stop", "arg": ""}
     if s.lower() in ("quit", "q", "exit", "/quit", "/q", "/exit"):
         return {"type": "cmd", "cmd": "quit", "arg": ""}
     if s.startswith("@"):

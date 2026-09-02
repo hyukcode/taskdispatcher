@@ -66,6 +66,7 @@ python -m tasker plan "重构这个项目" --json
 :done  [<taskid>]    手动收尾任务（关闭其 stdin 让进程退出）
 :status              各任务进度（思考/工具/审批/注入计数）
 :plan                重打计划
+:stop /stop          中止当前任务并返回 tasker>（可用 /continue 继续）
 :quit                终止全部并退出
 ```
 

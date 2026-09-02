@@ -50,6 +50,7 @@ REPL_HELP = """\
   /status               显示当前会话的子任务状态
   /resume <session_id>  恢复中断任务或开启下一轮 goal loop
   /continue             当前会话再跑一轮
+  /stop                 运行中止当前任务（随后可用 /continue 继续）
   /restart <task_id>    从指定子任务重新执行，并重跑其下游任务
   /delete <session_id>  逻辑删除会话（保留计划、事件和工作区）
   /restore <session_id> 恢复逻辑删除的会话
@@ -566,6 +567,9 @@ class Repl:
         elif c in ("quit", "q", "exit"):
             console.warn("终止执行并退出…")
             self._quit_requested = True
+            loop.stop()
+        elif c == "stop":
+            console.warn("中止当前执行；会话已保存，可用 /continue 继续…")
             loop.stop()
         elif c == "help":
             tui.print_raw(HELP)
