@@ -71,6 +71,20 @@ python -m tasker plan "重构这个项目" --json
 
 > Claude 子任务使用持久的 SDK 会话；Codex 子任务使用持久的 App Server thread，运行中注入的消息会进入当前会话。
 
+执行结束后，结果区会先列出每个子任务的状态、耗时、尝试次数、工作目录、交付结果和错误，再显示总体 goal 结果。空闲提示符 `tasker>` 下可使用：
+
+```
+/continue              继续当前 tasker 会话；复用成功任务，重新执行未完成任务
+/resume <session_id>   恢复指定的中断会话
+/restart <task_id>     从指定子任务重新执行，并重跑它的所有下游任务
+/status                查看当前会话的子任务状态
+/new <目标>             新建一个独立任务会话
+```
+
+`/continue` 和 `/restart` 会复用相同的 tasker session、任务工作区、成功任务输出和事件日志，但会为重新执行的任务创建新的 runner 尝试；它们不是把已经结束的 Claude SDK 对话或 Codex turn 原样重新连接。运行中的消息注入仍使用 `@t2`、`@claude`、`@codex` 或 `@all`。
+
+`/restart t3` 会保留 `t3` 的上游成功任务，只清除 `t3` 及其下游任务的当前快照，然后按依赖顺序重跑；事件日志和历史记录仍保留。`/delete <session_id>` 只标记会话为已删除，保留计划、事件日志和工作区，可用 `/restore <session_id>` 恢复。
+
 ---
 
 ## 架构
@@ -91,7 +105,9 @@ planner ──► Plan {tasks[], depends_on[], executor: claude|codex}
         ├─► CodexAppServerRunner ─► codex app-server（JSON-RPC）
         │        │             approval_request / tool_call / reasoning / completed
         │        ▼
-        └─► 所有任务共享 ~/.tasker/workspace/<session_id>
+        ├─► session workspace ─► 中间产物、读取结果和会话事件
+        │    同层仅显式 workspace_access=read_only 的任务并发，含写任务的层串行
+        └─► repository tasks ─► tasker 启动目录（无代码时由用户确认仓库目录）
              事件写入 ~/.tasker/sessions/<session_id>/events/<task>.events.jsonl
             │
             ▼
@@ -117,6 +133,8 @@ tasker/
   llm.py / config.py / spawn.py / models.py / console.py
 ```
 
+`SubTask.workspace_access` 可取 `read_only` 或 `write`。默认是 `write`；同层只有纯只读任务允许并发，避免多个 agent 同时覆盖文件。`SubTask.workdir_scope` 可取 `session` 或 `repository`：读取项目、调研、分析、方案设计、测试、验证和代码实现任务使用用户确认的 repository 目录；session workspace 只保存日志、事件和明确的中间产物。tasker 启动目录没有代码文件时，进入 REPL 前会询问仓库目录。
+
 ---
 
 ## 配置（config.json）
@@ -132,10 +150,19 @@ tasker/
 | `claude` | `completion_idle` | `5.0` | 最终 result 后无活动秒数 → 关闭 stdin 收尾 |
 | `codex` | `sandbox` | `workspace-write` | `read-only` / `workspace-write` / `danger-full-access` |
 | `codex` | `approval_policy` | `on-request` | Codex App Server 的审批策略 |
-| `session` | `workspace_dir` | `~/.tasker/workspace` | 同一 session 下所有任务共享的工作目录 |
+| `session` | `workspace_dir` | `~/.tasker/workspace` | session 中间产物目录；代码任务改用用户确认的 repository 目录 |
 | `display` | `level` | `minimal` | `minimal` 核心事件；`verbose` 详情；`debug` 原始协议事件 |
 | `approval` | `mode` | `auto` | `auto` / `log` / `ask_console` |
 | `approval` | `default_allow` | `true` | auto 模式的默认决定 |
+| `retry` | `max_retries` | `1` | 同一 executor 对临时/超时/协议失败的最大重试次数 |
+| `retry` | `initial_delay` / `max_delay` | `1` / `30` | 指数退避的首个和最大等待秒数 |
+| `dispatch` | `failover_enabled` | `true` | Claude/Codex 任务失败时是否切换另一 agent 重试 |
+| `dispatch` | `max_failover_attempts` | `1` | 每个任务最多允许的备用 agent 尝试次数；`0` 表示关闭故障转移 |
+| `review` | `enabled` | `false` | 是否启用独立 reviewer + 证据验证阶段 |
+| `review` | `reviewer_count` / `min_confidence` | `2` / `80` | reviewer 数量（最多 3 个角度）和验证通过置信度阈值 |
+| `tools` | `entries` | `[]` | 注册额外工具元数据；只描述能力，不执行配置中的命令 |
+| `hooks` | `rules` | `[]` | 工具调用前/后的字符串、路径策略；支持 `warn` / `block` |
+| `runtime` | `*_queue_maxsize` / `max_*_chars` | 见示例 | 限制事件、输入队列和注入上下文，避免长任务无限增长 |
 | — | `max_parallel` | `2` | 同层并发数 |
 | — | `timeout_per_task` | `900` | 单任务超时 |
 
@@ -146,6 +173,10 @@ tasker/
 - **Claude**：由 `claude-agent-sdk` 管理会话、工具调用和权限回调。
 - **Codex**：由 `codex app-server --listen stdio://` 管理 thread/turn、事件流和审批请求。
 - **权限**：两种执行器都通过统一的 `permission_request` / `permission_result` 事件接入审批策略。
+- **工具发现**：planner 和 worker 会从有界的 `ToolCatalog` 中按提示搜索工具；搜索结果仍需经过 executor、读写权限、工作目录、allow/deny 和审批策略校验。
+- **故障转移**：先对临时、超时和协议失败做有限指数退避，再按策略切换另一种 agent；每次尝试保存 `attempt_id`、父尝试、失败分类和转换原因。人工审查拒绝、权限拒绝和主动停止不会通过切换 agent 绕过。
+- **独立审查**：`review.enabled=true` 时，代码任务结束后运行多个只读审查角度，再由验证 reviewer 核对文件/测试证据；不通过会进入下一轮目标循环。
+- **阶段工作流**：模板可选 `workflow.stages`，Tasker 会增加阶段屏障和阶段事件，但不会改写模板目标、任务标题、描述、验收标准或任务数量。
 - **编码**：全程 UTF-8；Windows、macOS、Linux 均使用 headless 事件采集。
 - **SIGINT**：`Ctrl-C` 触发优雅中断。
 

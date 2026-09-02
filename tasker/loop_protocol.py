@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+from .formatting import extract_json_object
 
 
 def parse_loop_decision(output: str) -> dict | None:
@@ -8,21 +8,10 @@ def parse_loop_decision(output: str) -> dict | None:
     text = (output or "").strip()
     if not text:
         return None
-    candidates = [text]
-    if "```" in text:
-        candidates.extend(part.strip() for part in text.split("```") if part.strip())
-    for candidate in candidates:
-        try:
-            value = json.loads(candidate)
-        except json.JSONDecodeError:
-            decoder = json.JSONDecoder()
-            start = candidate.find("{")
-            if start < 0:
-                continue
-            try:
-                value, _ = decoder.raw_decode(candidate[start:])
-            except json.JSONDecodeError:
-                continue
-        if isinstance(value, dict) and value.get("status") in {"passed", "needs_iteration"}:
-            return value
+    try:
+        value = extract_json_object(text)
+    except ValueError:
+        return None
+    if value.get("status") in {"passed", "needs_iteration"}:
+        return value
     return None

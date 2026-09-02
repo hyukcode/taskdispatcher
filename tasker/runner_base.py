@@ -8,6 +8,7 @@ App Server 的行为在边界条件上逐渐分叉。
 from __future__ import annotations
 
 import queue
+import logging
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -16,11 +17,16 @@ from typing import Callable, Optional
 from .approvals import ApprovalBroker
 from .config import Config
 from .models import Event, TaskLoop, TaskRun
+from .policy_hooks import HookChain, HookContext, HookOutcome
+from .tool_catalog import ToolCatalog, ToolDecision
 
 
 EventSink = Callable[[Optional[TaskRun], Event], None]
 _INPUT_STOP = object()
 _EVENT_STOP = object()
+
+
+logger = logging.getLogger(__name__)
 
 
 class RunnerBase(ABC):
@@ -48,6 +54,8 @@ class RunnerBase(ABC):
         on_event: EventSink,
         prompt: str,
         broker: ApprovalBroker | None = None,
+        tool_catalog: ToolCatalog | None = None,
+        hook_chain: HookChain | None = None,
     ):
         self.cfg = cfg
         self.run = run
@@ -55,19 +63,25 @@ class RunnerBase(ABC):
         self.on_event = on_event
         self.prompt = prompt
         self.broker = broker or ApprovalBroker(cfg.approval)
+        self.tool_catalog = tool_catalog
+        self.hook_chain = hook_chain or HookChain()
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._closed = False
-        self._input_queue: queue.Queue = queue.Queue()
+        runtime = getattr(cfg, "runtime", None)
+        input_queue_maxsize = max(1, int(getattr(runtime, "input_queue_maxsize", 64)))
+        event_queue_maxsize = max(1, int(getattr(runtime, "event_queue_maxsize", 2048)))
+        self._input_queue: queue.Queue = queue.Queue(maxsize=input_queue_maxsize)
         self._input_lock = threading.Lock()
         self._input_closed = False
-        self._event_queue: queue.Queue = queue.Queue()
+        self._event_queue: queue.Queue = queue.Queue(maxsize=event_queue_maxsize)
         self._event_thread: threading.Thread | None = None
         self._event_close_lock = threading.Lock()
         self._event_order_lock = threading.Lock()
         self._event_queue_closed = False
         self._event_sequence = 0
+        self._dropped_events = 0
         self._interactions: list[str] = []
         self._result_ts: float | None = None
         self._injection_ts: float | None = None
@@ -124,7 +138,7 @@ class RunnerBase(ABC):
                 self.on_event(self.run, event)
             except Exception:
                 # 展示/持久化失败不应反向杀死 agent 的协议线程。
-                pass
+                logger.exception("任务 %s 的事件 sink 处理失败", self.run.task.id)
 
     @abstractmethod
     def _run_transport(self) -> None:
@@ -173,7 +187,7 @@ class RunnerBase(ABC):
         try:
             self._finalize_transport()
         except Exception:
-            pass
+            logger.exception("%s transport 优雅关闭失败", self.source)
         self._join_thread()
         self._close_event_queue()
         self._join_event_thread()
@@ -187,7 +201,7 @@ class RunnerBase(ABC):
         try:
             self._stop_transport()
         except Exception:
-            pass
+            logger.exception("%s transport 强制停止失败", self.source)
         self._join_thread()
         self._close_event_queue()
         self._join_event_thread()
@@ -266,6 +280,51 @@ class RunnerBase(ABC):
     def approval_respond(self, req_id: str, allowed: bool) -> bool:
         return self.broker.resolve(req_id, allowed=allowed)
 
+    def tool_decision(self, tool_name: str) -> ToolDecision | None:
+        """校验已知工具；未知工具交给后端自身的动态工具策略处理。"""
+        if self.tool_catalog is None:
+            return None
+        decision = self.tool_catalog.decision(
+            tool_name,
+            executor=self.source,
+            workspace_access=self.run.task.workspace_access,
+            workdir_scope=self.run.task.workdir_scope,
+        )
+        return decision if decision.descriptor is not None else None
+
+    def before_tool(self, tool_name: str, input_data: dict) -> HookOutcome:
+        """执行器真正调用工具前运行策略钩子。"""
+        outcome = self.hook_chain.before_tool(
+            HookContext(
+                executor=self.source,
+                task_id=self.run.task.id,
+                attempt_id=self.run.attempt_id,
+                tool_name=str(tool_name),
+                input_data=input_data if isinstance(input_data, dict) else {},
+                workdir=self.workdir,
+            )
+        )
+        for warning in outcome.warnings:
+            self._emit(Event(kind="system", source="orchestrator", text=warning, data={"hook": True, "phase": "before_tool"}))
+        return outcome
+
+    def after_tool(self, tool_name: str, input_data: dict, result: object = None) -> HookOutcome:
+        """工具调用结束后运行审计/提示钩子；后置钩子不能撤销已完成的调用。"""
+        outcome = self.hook_chain.after_tool(
+            HookContext(
+                executor=self.source,
+                task_id=self.run.task.id,
+                attempt_id=self.run.attempt_id,
+                tool_name=str(tool_name),
+                input_data=input_data if isinstance(input_data, dict) else {},
+                workdir=self.workdir,
+            ),
+            result,
+        )
+        for warning in outcome.warnings:
+            self._emit(Event(kind="system", source="orchestrator", text=warning, data={"hook": True, "phase": "after_tool"}))
+        return outcome
+
     def _emit(self, event: Event) -> None:
         self._last_event_ts = time.time()
         with self._event_order_lock:
@@ -276,7 +335,30 @@ class RunnerBase(ABC):
                 if event.data is None:
                     event.data = {}
                 event.data.setdefault("sequence", self._event_sequence)
-                self._event_queue.put(event)
+                try:
+                    self._event_queue.put_nowait(event)
+                except queue.Full:
+                    # 高频思考/原始事件可以丢弃，审批、错误和结果事件短暂背压，
+                    # 防止无限队列吞噬内存，也不让关键状态静默消失。
+                    if event.kind in {"thinking", "raw", "text", "tool_result"}:
+                        self._dropped_events += 1
+                        logger.warning(
+                            "任务 %s 事件队列已满，丢弃 %s 事件（累计 %s）",
+                            self.run.task.id,
+                            event.kind,
+                            self._dropped_events,
+                        )
+                        return
+                    try:
+                        self._event_queue.put(event, timeout=0.5)
+                    except queue.Full:
+                        self._dropped_events += 1
+                        logger.error(
+                            "任务 %s 关键事件队列已满，丢弃 %s 事件（累计 %s）",
+                            self.run.task.id,
+                            event.kind,
+                            self._dropped_events,
+                        )
 
     def _finish_failure(self, message: str) -> None:
         if self.run.status == "failed" and self.run.error == message:

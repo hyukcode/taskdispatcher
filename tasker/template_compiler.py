@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 
 from . import console
 from .config import Config
+from .formatting import extract_json_object
 from .llm import LLMError, chat
 from .models import (
     CompiledGraph,
@@ -14,8 +16,13 @@ from .models import (
     SubTask,
     graph_from_dict,
     graph_to_dict,
+    infer_workspace_access,
+    infer_workdir_scope,
     task_loop_from_dict,
 )
+
+
+logger = logging.getLogger(__name__)
 
 LOOP_INFER_PROMPT = """\
 你是一个任务流程分析器。下面给你一个任务模板的步骤清单，每步含 id / title / description / acceptance。
@@ -65,20 +72,13 @@ def load_named_template(name: str) -> dict | None:
 
 
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    if text.startswith("```"):
-        import re
-
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        raise LLMError("LLM 返回内容中没有 JSON 对象")
-    return json.loads(text[start : end + 1])
+    try:
+        return extract_json_object(text)
+    except ValueError as exc:
+        raise LLMError(f"LLM 返回内容中没有合法 JSON 对象: {exc}") from exc
 
 def nodes_from_template(template: dict, default_executor: str = "codex") -> list[SubTask]:
-    """每条 suggested_tasks → 一个 SubTask；planner 编排结果会覆盖 executor。"""
+    """每条 suggested_tasks → 一个 SubTask；executor 和 tool 可由后续编排动态决策。"""
     suggested = template.get("suggested_tasks") or []
     nodes: list[SubTask] = []
     for i, t in enumerate(suggested, start=1):
@@ -92,10 +92,35 @@ def nodes_from_template(template: dict, default_executor: str = "codex") -> list
                 depends_on=[],
                 acceptance=str(t.get("acceptance") or ""),
                 tool=str(t.get("tool") or t.get("skill") or ""),
+                workspace_access=infer_workspace_access(t),
+                workdir_scope=infer_workdir_scope(t, enforce_repository_semantics=True),
                 internal_loop=task_loop_from_dict(t.get("internal_loop", t.get("loop"))),
             )
         )
     return nodes
+
+
+_TEMPLATE_LOCKED_FIELDS = (
+    "title",
+    "description",
+    "acceptance",
+    "workspace_access",
+    "workdir_scope",
+)
+
+
+def validate_template_contract(graph: CompiledGraph, template: dict) -> None:
+    """确保编排结果没有改写模板契约；工具提示故意不在锁定字段内。"""
+    expected_nodes = nodes_from_template(template)
+    actual_ids = [node.id for node in graph.nodes]
+    expected_ids = [node.id for node in expected_nodes]
+    if actual_ids != expected_ids:
+        raise ValueError("模板任务清单的数量、顺序或 ID 不可修改")
+
+    for actual, expected in zip(graph.nodes, expected_nodes):
+        for field in _TEMPLATE_LOCKED_FIELDS:
+            if getattr(actual, field) != getattr(expected, field):
+                raise ValueError(f"模板任务 {actual.id} 的 {field} 不可修改")
 
 
 def linear_graph(nodes: list[SubTask]) -> CompiledGraph:
@@ -189,7 +214,8 @@ def _load_cache(key: str) -> CompiledGraph | None:
     try:
         data = json.loads(f.read_text(encoding="utf-8"))
         return graph_from_dict(data.get("compiled", {}))
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+        logger.debug("读取模板编译缓存失败: %s", exc, exc_info=True)
         return None
 
 
@@ -199,8 +225,8 @@ def _save_cache(key: str, graph: CompiledGraph) -> None:
         f.write_text(
             json.dumps({"compiled": graph_to_dict(graph)}, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("写入模板编译缓存失败: %s", exc, exc_info=True)
 
 
 def compile_template(
@@ -220,7 +246,12 @@ def compile_template(
     if cache and loop_info is None:
         cached = _load_cache(key)
         if cached is not None and cached.nodes:
-            return cached
+            try:
+                validate_template_contract(cached, template)
+            except ValueError:
+                logger.info("模板编译缓存与当前任务目录契约不一致，重新编译: %s", key)
+            else:
+                return cached
 
     if loop_info is not None:
         graph = apply_loop(linear_graph(nodes), loop_info)

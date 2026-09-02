@@ -17,11 +17,11 @@ pip uninstall multicc
 1. 在**源码机**离线构建 wheel（纯标准库，无需网络 / wheel / setuptools）：
    ```bash
    python scripts/build_wheel.py
-   # → dist/multicc-0.6.1-py3-none-any.whl
+   # → dist/multicc-0.6.2-py3-none-any.whl
    ```
 2. 把该 `.whl` 拷到目标机：
    ```bash
-   pip install multicc-0.6.1-py3-none-any.whl
+   pip install multicc-0.6.2-py3-none-any.whl
    ```
    wheel 安装不触发构建、不需要网络。
 
@@ -53,7 +53,7 @@ python scripts/publish.py               # 正式发 PyPI
 
 ### 3. 验证
 ```bash
-pip install multicc==0.6.1
+pip install multicc==0.6.2
 tasker --version
 tasker verify-config
 ```

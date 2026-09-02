@@ -36,7 +36,9 @@
     "implementation_executor": "claude",
     "verification_executor": "codex",
     "claude_model": "DeepSeek-v4-pro",
-    "codex_model": "ChatGPT-5.6"
+    "codex_model": "ChatGPT-5.6",
+    "failover_enabled": true,
+    "max_failover_attempts": 1
   },
   "goal_loop": {
     "max_iterations": 1,

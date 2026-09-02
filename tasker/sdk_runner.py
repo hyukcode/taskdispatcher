@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from concurrent import futures
 
@@ -10,7 +11,9 @@ from .config import Config
 from .formatting import compact_json as _compact
 from .loop_protocol import parse_loop_decision
 from .models import Event, TaskRun
+from .policy_hooks import HookChain
 from .runner_base import EventSink, RunnerBase
+from .tool_catalog import ToolCatalog
 
 try:
     import claude_agent_sdk as sdk
@@ -18,15 +21,38 @@ except ImportError:
     sdk = None
 
 
+logger = logging.getLogger(__name__)
+
+
 class SdkClaudeRunner(RunnerBase):
     source = "claude"
     config_key = "claude"
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event: EventSink, prompt: str, broker=None):
-        super().__init__(cfg, run, workdir, on_event, prompt, broker=broker)
+    def __init__(
+        self,
+        cfg: Config,
+        run: TaskRun,
+        workdir: str,
+        on_event: EventSink,
+        prompt: str,
+        broker=None,
+        tool_catalog: ToolCatalog | None = None,
+        hook_chain: HookChain | None = None,
+    ):
+        super().__init__(
+            cfg,
+            run,
+            workdir,
+            on_event,
+            prompt,
+            broker=broker,
+            tool_catalog=tool_catalog,
+            hook_chain=hook_chain,
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client = None
         self._tool_names: dict[str, str] = {}
+        self._tool_inputs: dict[str, dict] = {}
         self._next_loop_prompt = ""
 
     def _prepare_start(self) -> None:
@@ -130,14 +156,14 @@ class SdkClaudeRunner(RunnerBase):
             try:
                 client.disconnect()
             except Exception:
-                pass
+                logger.debug("Claude SDK disconnect 失败", exc_info=True)
 
     def _stop_transport(self) -> None:
         if self._client is not None:
             try:
                 self._client.disconnect()
             except Exception:
-                pass
+                logger.debug("Claude SDK stop disconnect 失败", exc_info=True)
 
     async def _can_use_tool(self, tool_name: str, input_data: dict, context) -> sdk.PermissionResult:
         tool_use_id = (context.tool_use_id if context is not None else None) or str(time.time())
@@ -149,6 +175,16 @@ class SdkClaudeRunner(RunnerBase):
             data={"tool": tool_name, "input": input_data, "id": tool_use_id, "tool_use_id": tool_use_id, "auto": mode == "auto"},
         )
         self._emit(req)
+
+        hook = self.before_tool(tool_name, input_data if isinstance(input_data, dict) else {})
+        if not hook.allowed:
+            self._permission_result(req, False, hook.message)
+            return sdk.PermissionResultDeny(message=hook.message)
+
+        policy = self.tool_decision(tool_name)
+        if policy is not None and not policy.allowed:
+            self._permission_result(req, False, policy.reason)
+            return sdk.PermissionResultDeny(message=policy.reason)
 
         if mode == "auto":
             allowed = self.cfg.approval.default_allow
@@ -243,6 +279,7 @@ class SdkClaudeRunner(RunnerBase):
             self._emit(Event(kind="text", source=self.source, text=str(block.text or "")))
         elif isinstance(block, (sdk.ToolUseBlock, sdk.ServerToolUseBlock)):
             self._tool_names[block.id] = block.name
+            self._tool_inputs[block.id] = block.input or {}
             self._emit(
                 Event(
                     kind="tool_use",
@@ -253,9 +290,15 @@ class SdkClaudeRunner(RunnerBase):
             )
         elif isinstance(block, (sdk.ToolResultBlock, sdk.ServerToolResultBlock)):
             name = self._tool_names.get(str(block.tool_use_id), "?")
+            input_data = self._tool_inputs.get(str(block.tool_use_id), {})
             content = block.content
             if not isinstance(content, str):
                 content = json.dumps(content, ensure_ascii=False, default=str)
+            self.after_tool(
+                name,
+                input_data,
+                {"is_error": bool(getattr(block, "is_error", False)), "content": content},
+            )
             self._emit(
                 Event(
                     kind="tool_result",
@@ -365,6 +408,7 @@ def _usage_dict(value) -> dict:
             try:
                 data = fn()
             except Exception:
+                logger.debug("读取 SDK usage 对象失败", exc_info=True)
                 continue
             if isinstance(data, dict):
                 return data

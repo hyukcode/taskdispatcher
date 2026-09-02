@@ -18,7 +18,6 @@ import csv
 import hashlib
 import io
 import os
-import re
 import sys
 import zipfile
 from pathlib import Path
@@ -38,10 +37,16 @@ NAME = "multicc"
 
 def _project_version() -> str:
     text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r'^version\s*=\s*"([^"]+)"', text, re.MULTILINE)
-    if not match:
-        raise RuntimeError("pyproject.toml 中缺少 project.version")
-    return match.group(1)
+    for line in text.splitlines():
+        left, separator, right = line.partition("=")
+        if not separator or left.strip() != "version":
+            continue
+        value = right.strip()
+        if value.startswith('"'):
+            end = value.find('"', 1)
+            if end > 1:
+                return value[1:end]
+    raise RuntimeError("pyproject.toml 中缺少 project.version")
 
 
 VERSION = _project_version()

@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import os
+import logging
 import sys
 import threading
 from typing import Callable
 
+
+logger = logging.getLogger(__name__)
+
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
-    except Exception:
-        pass
+    except (AttributeError, OSError, ValueError) as exc:
+        logger.debug("终端编码配置失败: %s", exc, exc_info=True)
 
 _C = {
     "reset": "\033[0m",
@@ -36,8 +40,8 @@ def _enable_vt() -> None:
             if k.GetConsoleMode(handle, ctypes.byref(mode)):
                 # 只打开 VT processing，保留控制台已有的输入/输出标志。
                 k.SetConsoleMode(handle, mode.value | 0x0004)
-        except Exception:
-            pass
+        except (AttributeError, OSError, ValueError) as exc:
+            logger.debug("Windows VT 模式启用失败: %s", exc, exc_info=True)
 
 
 _enabled = None
@@ -56,7 +60,8 @@ def _use_color() -> bool:
             _enable_vt()
             try:
                 _enabled = sys.stdout.isatty()
-            except Exception:
+            except (AttributeError, OSError) as exc:
+                logger.debug("检测终端颜色能力失败: %s", exc, exc_info=True)
                 _enabled = False
     return _enabled
 
@@ -101,9 +106,9 @@ def _out(text: str, stream=None, **kw) -> None:
         with _output_lock:
             target.write(text + "\n")
             target.flush()
-    except (BrokenPipeError, OSError):
+    except (BrokenPipeError, OSError) as exc:
         # 管道下游提前退出时，CLI 不应因为输出失败再抛一层异常。
-        pass
+        logger.debug("输出目标已关闭: %s", exc)
 
 
 def banner(text: str) -> None:

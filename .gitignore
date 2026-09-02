@@ -7,3 +7,4 @@ reports/
 dist/
 *.egg-info/
 .venv-test/
+tests/

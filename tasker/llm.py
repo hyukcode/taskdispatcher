@@ -28,9 +28,11 @@ def _build_headers(cfg: LLMConfig) -> dict[str, str]:
 
 def _post(cfg: LLMConfig, body: dict[str, Any]) -> dict[str, Any]:
     if cfg.provider == "anthropic":
-        url = (cfg.base_url or "https://api.anthropic.com/v1/messages").rstrip("/")
+        base = (cfg.base_url or "https://api.anthropic.com/v1").rstrip("/")
+        url = base if base.endswith("/messages") else base + "/messages"
     else:
-        url = (cfg.base_url or "https://api.openai.com/v1/chat/completions").rstrip("/")
+        base = (cfg.base_url or "https://api.openai.com/v1").rstrip("/")
+        url = base if base.endswith("/chat/completions") else base + "/chat/completions"
     req = urllib.request.Request(
         url,
         data=json.dumps(body).encode("utf-8"),
@@ -39,16 +41,22 @@ def _post(cfg: LLMConfig, body: dict[str, Any]) -> dict[str, Any]:
     )
     try:
         with urllib.request.urlopen(req, timeout=cfg.timeout) as resp:  # noqa: S310
-            return json.loads(resp.read().decode("utf-8"))
+            try:
+                return json.loads(resp.read().decode("utf-8"))
+            except json.JSONDecodeError as exc:
+                raise LLMError("LLM 返回内容不是合法 JSON") from exc
     except urllib.error.HTTPError as e:
         detail = ""
         try:
             detail = e.read().decode("utf-8", "replace")
-        except Exception:
-            pass
+        except (OSError, UnicodeDecodeError) as exc:
+            # HTTP 错误正文读取失败不应掩盖原始状态码。
+            detail = f"（错误详情读取失败: {exc}）"
         raise LLMError(f"LLM HTTP {e.code}: {e.reason} {detail[:800]}") from e
     except urllib.error.URLError as e:
         raise LLMError(f"LLM 网络错误: {e.reason}") from e
+    except (TimeoutError, OSError) as e:
+        raise LLMError(f"LLM 网络错误: {e}") from e
 
 
 def chat(
@@ -61,7 +69,7 @@ def chat(
     body: dict[str, Any] = {
         "model": cfg.model,
         "temperature": cfg.temperature if temperature is None else temperature,
-        "max_tokens": max_tokens or cfg.max_tokens,
+        "max_tokens": cfg.max_tokens if max_tokens is None else max_tokens,
         "messages": messages,
     }
     data = _post(cfg, body)

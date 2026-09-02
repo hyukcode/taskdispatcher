@@ -78,6 +78,22 @@ def _load_template_from_file(path: str) -> dict | None:
 
     from pathlib import Path
 
+    def task_item(task: dict, *, include_loop: bool = False) -> dict:
+        item = {
+            "title": task.get("title", ""),
+            "description": task.get("description", ""),
+            "acceptance": task.get("acceptance", ""),
+            "tool": task.get("tool") or task.get("skill", ""),
+        }
+        for field in ("id", "depends_on", "workspace_access", "workdir_scope"):
+            if field in task:
+                item[field] = task[field]
+        if "workdir_scope" not in item and "repository" in task:
+            item["workdir_scope"] = "repository" if task["repository"] else "session"
+        if include_loop:
+            item["internal_loop"] = task.get("internal_loop", task.get("loop"))
+        return item
+
     p = Path(path).expanduser().resolve()
     if not p.exists():
         console.warn(f"模板文件不存在: {p}")
@@ -92,16 +108,7 @@ def _load_template_from_file(path: str) -> dict | None:
                 data.pop("_meta", None)
                 return data
             if "objective" in data and "tasks" in data:
-                items = [
-                    {
-                        "title": t.get("title", ""),
-                        "description": t.get("description", ""),
-                        "acceptance": t.get("acceptance", ""),
-                        "tool": t.get("tool") or t.get("skill", ""),
-                        "internal_loop": t.get("internal_loop", t.get("loop")),
-                    }
-                    for t in data.get("tasks", [])
-                ]
+                items = [task_item(t, include_loop=True) for t in data.get("tasks", [])]
                 return {
                     "template_name": data.get("objective", ""),
                     "source_file": str(p),
@@ -128,15 +135,7 @@ def _load_template_from_file(path: str) -> dict | None:
         if "template_name" in data:
             return data
         if "objective" in data and "tasks" in data:
-            items = [
-                {
-                    "title": t.get("title", ""),
-                    "description": t.get("description", ""),
-                    "acceptance": t.get("acceptance", ""),
-                    "tool": t.get("tool") or t.get("skill", ""),
-                }
-                for t in data.get("tasks", [])
-            ]
+            items = [task_item(t) for t in data.get("tasks", [])]
             return {
                 "template_name": data.get("objective", ""),
                 "source_file": str(p),

@@ -15,6 +15,7 @@ app-server 是持久 JSON-RPC 进程，支持双向通信。
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 from . import __version__
@@ -22,8 +23,13 @@ from .config import Config
 from .formatting import compact_json as _compact
 from .loop_protocol import parse_loop_decision
 from .models import Event, TaskRun
+from .policy_hooks import HookChain
 from .runner_base import EventSink, RunnerBase
 from .spawn import ProcChannel, resolve_binary, start_process
+from .tool_catalog import ToolCatalog
+
+
+logger = logging.getLogger(__name__)
 
 # ---- 审批相关的 server→client 请求方法 ----
 _APPROVAL_METHODS = frozenset(
@@ -66,8 +72,27 @@ class CodexAppServerRunner(RunnerBase):
     source = "codex"
     config_key = "codex"
 
-    def __init__(self, cfg: Config, run: TaskRun, workdir: str, on_event: EventSink, prompt: str, broker=None):
-        super().__init__(cfg, run, workdir, on_event, prompt, broker=broker)
+    def __init__(
+        self,
+        cfg: Config,
+        run: TaskRun,
+        workdir: str,
+        on_event: EventSink,
+        prompt: str,
+        broker=None,
+        tool_catalog: ToolCatalog | None = None,
+        hook_chain: HookChain | None = None,
+    ):
+        super().__init__(
+            cfg,
+            run,
+            workdir,
+            on_event,
+            prompt,
+            broker=broker,
+            tool_catalog=tool_catalog,
+            hook_chain=hook_chain,
+        )
         self.channel: ProcChannel | None = None
         self._rpc_id = 0
         self._thread_id: str | None = None
@@ -101,6 +126,7 @@ class CodexAppServerRunner(RunnerBase):
             try:
                 self.channel.proc.wait(timeout=8)
             except Exception:
+                logger.debug("等待 Codex app-server 结束失败，改为强制停止", exc_info=True)
                 self.channel.stop()
 
     def _stop_transport(self) -> None:
@@ -566,6 +592,11 @@ class CodexAppServerRunner(RunnerBase):
             output = item.get("text") or item.get("aggregatedOutput") or ""
             if not isinstance(output, str):
                 output = json.dumps(output, ensure_ascii=False, default=str)
+            self.after_tool(
+                name,
+                item if isinstance(item, dict) else {},
+                {"is_error": is_error, "status": status, "output": output},
+            )
             self._emit(
                 Event(
                     kind="tool_result",
@@ -762,6 +793,19 @@ class CodexAppServerRunner(RunnerBase):
         mode = self.cfg.approval.mode
         req = Event(kind="permission_request", source=self.source, text=text, data={**data, "auto": mode == "auto"})
         self._emit(req)
+
+        policy_tool = {
+            "item/commandExecution/requestApproval": "run_command",
+            "item/fileChange/requestApproval": "edit_file",
+        }.get(method)
+        hook = self.before_tool(policy_tool, params) if policy_tool else None
+        if hook is not None and not hook.allowed:
+            self._decide_approval(msg, False, f"工具钩子拒绝：{hook.message}")
+            return
+        policy = self.tool_decision(policy_tool) if policy_tool else None
+        if policy is not None and not policy.allowed:
+            self._decide_approval(msg, False, f"工具策略拒绝：{policy.reason}")
+            return
 
         if mode == "auto":
             self._decide_approval(msg, bool(self.cfg.approval.default_allow), "auto 模式", auto=True)

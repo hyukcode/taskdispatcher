@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import os
 import queue
-import re
+import logging
 import sys
 import threading
 
 from . import console
 from .formatting import compact_json
 from .models import Event, TaskRun
+
+
+logger = logging.getLogger(__name__)
 
 HELP = """\
 输入指令（agent 运行期间随时可用）：
@@ -24,8 +27,10 @@ HELP = """\
   :deny  [<id>]        拒绝最近/指定工具审批请求
   :approve [<id>]      人工审查点：通过
   :reject <反馈>       人工审查点：驳回（反馈注回上游重跑）
-  :status              打印各任务进度
+  :status              打印各任务进度、耗时和注入计数
   :plan                重新打印计划
+  :continue            执行中无操作；结束后在 tasker> 下继续会话
+  :new / :restart      执行中不可切换；结束后在 tasker> 下使用对应命令
   :pause / :resume     暂停输入转发 / 恢复
   :quit / quit / exit  终止所有运行中的 agent 并退出程序（或 Ctrl+C）
 """
@@ -69,9 +74,9 @@ def parse_input_line(raw: str) -> dict:
     if s.lower() in ("quit", "q", "exit", "/quit", "/q", "/exit"):
         return {"type": "cmd", "cmd": "quit", "arg": ""}
     if s.startswith("@"):
-        m = re.match(r"@(\S+)(?:\s+(.*))?$", s)
-        target = (m.group(1) or "all").lower() if m else "all"
-        text = (m.group(2) or "").strip() if m else ""
+        parts = s[1:].split(None, 1)
+        target = (parts[0] if parts else "all").lower()
+        text = parts[1].strip() if len(parts) > 1 else ""
         return {"type": "msg", "target": target, "text": text}
     return {"type": "msg", "target": "all", "text": s}
 
@@ -90,7 +95,8 @@ class TerminalSession:
     def available() -> bool:
         try:
             return bool(sys.stdin.isatty() and sys.stdout.isatty())
-        except Exception:
+        except (AttributeError, OSError) as exc:
+            logger.debug("检测交互式终端失败: %s", exc, exc_info=True)
             return False
 
     def start(self) -> bool:
@@ -109,7 +115,8 @@ class TerminalSession:
             self._saved_attrs = termios.tcgetattr(fd)
             tty.setraw(fd)
             self._active = True
-        except Exception:
+        except (AttributeError, OSError, ValueError) as exc:
+            logger.debug("终端 raw mode 初始化失败: %s", exc, exc_info=True)
             self._saved_attrs = None
         return self._active or os.name == "nt"
 
@@ -120,8 +127,8 @@ class TerminalSession:
 
         try:
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._saved_attrs)
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            logger.debug("恢复终端属性失败: %s", exc, exc_info=True)
         finally:
             self._active = False
             self._saved_attrs = None
@@ -139,8 +146,8 @@ def _raw_char() -> str:
         if ch in ("\x00", "\xe0"):
             try:
                 msvcrt.getwch()
-            except Exception:
-                pass
+            except (AttributeError, OSError, UnicodeDecodeError) as exc:
+                logger.debug("读取 Windows 终端字符失败: %s", exc, exc_info=True)
             return ""
         return ch
     else:
@@ -156,7 +163,8 @@ def _raw_char_unix() -> str:
         if not select.select([fd], [], [], 0.1)[0]:
             return ""
         b = os.read(fd, 1)
-    except Exception:
+    except (OSError, ValueError) as exc:
+        logger.debug("读取 Unix 终端字符失败: %s", exc, exc_info=True)
         return ""
     if not b:
         return "\x04"
@@ -178,8 +186,8 @@ def _drain_esc_seq() -> None:
     try:
         while select.select([fd], [], [], 0.02)[0]:
             os.read(fd, 1)
-    except Exception:
-        pass
+    except (OSError, ValueError) as exc:
+        logger.debug("清理终端 escape sequence 失败: %s", exc, exc_info=True)
 
 
 class LiveTui:
@@ -199,7 +207,7 @@ class LiveTui:
         self._hold.clear()
         self._event_counts: dict[str, int] = {}
         self._input_buf = ""
-        self._prompt = "> "
+        self._prompt = "tasker> "
         self._terminal = TerminalSession()
         self._interactive = False
         self._output_hook = None
@@ -233,7 +241,7 @@ class LiveTui:
             return
         self._output_hook = self._console_hook
         self._previous_output_hook = console.set_output_hook(self._output_hook)
-        self.print_raw(console.paint("▶ 输入 :help 查看指令。审批时用 :allow / :deny 决定。", "dim"))
+        self.print_raw(console.paint("▶ tasker 已连接。输入 :help 查看指令；审批时用 :allow / :deny 决定。", "dim"))
         self._input_thread = threading.Thread(target=self._read_loop, daemon=True, name="tui-input")
         self._input_thread.start()
 
@@ -245,6 +253,7 @@ class LiveTui:
             try:
                 ch = _raw_char()
             except Exception:
+                logger.exception("实时输入线程异常")
                 break
             if not ch:
                 continue
@@ -334,7 +343,7 @@ class LiveTui:
         sys.stdout.flush()
 
     def emit(self, run: TaskRun | None, event: Event, source_tag: str = "") -> None:
-        tag = source_tag or event.source
+        tag = self._event_tag(run, event, source_tag)
         kind = event.kind
 
         if self._hold.is_set() and kind not in (
@@ -367,6 +376,17 @@ class LiveTui:
                 self._hold.clear()
             renderer = self._renderers.get(kind, self._emit_generic_locked)
             renderer(tag, event)
+
+    @staticmethod
+    def _event_tag(run: TaskRun | None, event: Event, source_tag: str = "") -> str:
+        """让多 agent 输出具备 CLI 风格的稳定上下文标签。"""
+        if source_tag:
+            return source_tag
+        if run is not None:
+            task_id = getattr(run.task, "id", "?")
+            executor = getattr(run.task, "executor", event.source)
+            return f"{task_id} · {executor}"
+        return event.source
 
     def _emit_user_message_locked(self, tag: str, event: Event) -> None:
         self._write_locked(console.paint(f"[{tag}] 👤 {event.text}", "cyan"))

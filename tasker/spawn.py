@@ -3,11 +3,15 @@ from __future__ import annotations
 
 import os
 import queue
+import logging
 import shutil
 import subprocess
 import threading
 from collections import deque
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_binary(name: str) -> str:
@@ -42,8 +46,8 @@ class ProcChannel:
             if self.proc.stdout is not None:
                 for line in self.proc.stdout:
                     self._lines.put(line)
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            logger.debug("读取 %s stdout 失败: %s", self.name, exc, exc_info=True)
         finally:
             self._lines.put(None)
 
@@ -54,8 +58,8 @@ class ProcChannel:
                 for line in self.proc.stderr:
                     with self._stderr_lock:
                         self._stderr_tail.append(line.rstrip("\r\n"))
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            logger.debug("读取 %s stderr 失败: %s", self.name, exc, exc_info=True)
 
     def next_line(self, timeout: float = 0.2) -> Optional[str]:
         try:
@@ -75,7 +79,8 @@ class ProcChannel:
                 stdin.write(data)
                 stdin.flush()
                 return True
-            except Exception:
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                logger.debug("写入 %s stdin 失败: %s", self.name, exc, exc_info=True)
                 return False
 
     def close_stdin(self) -> None:
@@ -83,8 +88,8 @@ class ProcChannel:
             try:
                 if self.proc.stdin and not self.proc.stdin.closed:
                     self.proc.stdin.close()
-            except Exception:
-                pass
+            except (BrokenPipeError, OSError, ValueError) as exc:
+                logger.debug("关闭 %s stdin 失败: %s", self.name, exc, exc_info=True)
 
     def poll(self) -> Optional[int]:
         return self.proc.poll()
@@ -103,19 +108,20 @@ class ProcChannel:
         try:
             if self.proc.poll() is None:
                 self.proc.terminate()
-        except Exception:
-            pass
+        except (OSError, ValueError) as exc:
+            logger.debug("终止 %s 失败: %s", self.name, exc, exc_info=True)
         try:
             self.proc.wait(timeout=5)
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.debug("等待 %s 退出超时或失败，尝试 kill: %s", self.name, exc, exc_info=True)
             try:
                 self.proc.kill()
-            except Exception:
-                pass
+            except (OSError, ValueError) as kill_exc:
+                logger.debug("kill %s 失败: %s", self.name, kill_exc, exc_info=True)
             try:
                 self.proc.wait(timeout=2)
-            except Exception:
-                pass
+            except (subprocess.TimeoutExpired, OSError) as wait_exc:
+                logger.debug("等待 %s 被 kill 后退出失败: %s", self.name, wait_exc, exc_info=True)
         for reader in (self._reader, self._stderr_reader):
             if reader.is_alive() and reader is not threading.current_thread():
                 reader.join(timeout=0.5)

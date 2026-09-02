@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 # 安装后优先读打包时注入的 _version.py；开发环境（源码）回退到读 pyproject.toml
@@ -17,8 +16,15 @@ except ImportError:
     try:
         _pyproject = Path(__file__).resolve().parent.parent / "pyproject.toml"
         _text = _pyproject.read_text(encoding="utf-8")
-        _m = re.search(r'^version\s*=\s*"([^"]+)"', _text, re.MULTILINE)
-        if _m:
-            __version__ = _m.group(1)
-    except Exception:
+        for _line in _text.splitlines():
+            _left, _separator, _right = _line.partition("=")
+            if not _separator or _left.strip() != "version":
+                continue
+            _value = _right.strip()
+            if _value.startswith('"'):
+                _end = _value.find('"', 1)
+                if _end > 1:
+                    __version__ = _value[1:_end]
+                    break
+    except (OSError, UnicodeError, ImportError):
         pass

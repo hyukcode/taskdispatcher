@@ -13,6 +13,8 @@ from .config import Config
 from .models import TaskRun
 from .runner_base import EventSink, RunnerBase
 from .sdk_runner import SdkClaudeRunner
+from .policy_hooks import HookChain
+from .tool_catalog import ToolCatalog
 
 
 RunnerType = Type[RunnerBase]
@@ -41,6 +43,17 @@ def create_runner(
     prompt: str,
     *,
     broker=None,
+    tool_catalog: ToolCatalog | None = None,
+    hook_chain: HookChain | None = None,
 ) -> RunnerBase:
     """按 executor 创建统一 runner；调用方不需要知道具体协议类。"""
-    return runner_type(executor)(cfg, run, workdir, on_event, prompt, broker=broker)
+    return runner_type(executor)(
+        cfg,
+        run,
+        workdir,
+        on_event,
+        prompt,
+        broker=broker,
+        tool_catalog=tool_catalog,
+        hook_chain=hook_chain,
+    )

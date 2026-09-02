@@ -18,12 +18,71 @@ EVENT_KINDS = (
     "review_result",       # 人工审查决定（含反馈）
     "user_message",        # 注入给执行器的用户消息
     "interaction",         # 其它交互事件（子代理、系统通知等）
+    "retry",               # 同一执行器的有限重试或跨执行器故障转移
     "usage",               # token / cost 统计（详情模式）
     "system",              # 系统事件
     "error",               # 错误
     "result",              # 最终结果
     "raw",                 # 无法解析的原始行
 )
+
+
+def is_valid_id(value: object) -> bool:
+    """判断任务/会话 ID 是否只包含安全的 ASCII 标识字符。"""
+    if not isinstance(value, str) or not value:
+        return False
+    first = value[0]
+    if not first.isascii() or not first.isalnum():
+        return False
+    return all(
+        character.isascii() and (character.isalnum() or character in "_-")
+        for character in value[1:]
+    )
+
+
+def infer_workspace_access(data: dict) -> str:
+    """读取任务声明；未声明时仅把明显的纯阅读任务标成 read_only。"""
+    if "workspace_access" in data:
+        return str(data.get("workspace_access") or "write").strip().lower()
+    text = " ".join(str(data.get(key) or "") for key in ("title", "description", "tool", "acceptance")).lower()
+    read_words = ("读取", "阅读", "搜索", "检索", "调研", "研究", "查询", "分析", "总结", "比较", "read", "search", "research", "analy")
+    write_words = ("实现", "编写", "修改", "修复", "重构", "编辑", "落地", "开发", "写入", "删除", "implement", "edit", "fix", "refactor", "build")
+    if any(word in text for word in read_words) and not any(word in text for word in write_words):
+        return "read_only"
+    return "write"
+
+
+def _has_repository_semantics(data: dict) -> bool:
+    text = " ".join(
+        str(data.get(key) or "") for key in ("title", "description", "tool", "acceptance")
+    ).lower()
+    repository_words = (
+        "实现", "编写", "修改", "修复", "重构", "编辑", "开发", "落地", "代码", "脚本", "项目",
+        "仓库", "读取", "阅读", "提取", "分析", "调研", "研究", "搜索", "检索", "查询",
+        "评估", "总结", "比较", "对比", "方案", "设计", "交互", "架构", "结构", "规范",
+        "约定", "审查", "复核", "测试", "验证", "编译", "运行测试", "implement", "write",
+        "edit", "fix", "refactor", "develop", "code", "script", "project", "repository", "repo",
+        "read", "inspect", "extract", "analy", "research", "search", "query", "assess", "review",
+        "design", "interaction", "architecture", "spec", "test", "verify", "build", "compile",
+    )
+    return any(word in text for word in repository_words)
+
+
+def infer_workdir_scope(data: dict, *, enforce_repository_semantics: bool = False) -> str:
+    """推断任务应该操作 session workspace 还是用户代码仓库。
+
+    session workspace 只承载事件、日志和明确的中间产物。规划新任务时，
+    ``enforce_repository_semantics=True`` 会让读取、分析、调研、方案设计、
+    验证和代码任务优先落到 repository，即使 LLM 错误地返回了 session。
+    读取已保存会话时保持默认值 False，避免重新加载历史快照时改变其签名。
+    """
+    if enforce_repository_semantics and _has_repository_semantics(data):
+        return "repository"
+    if "workdir_scope" in data:
+        return str(data.get("workdir_scope") or "session").strip().lower()
+    if "repository" in data:
+        return "repository" if bool(data.get("repository")) else "session"
+    return "repository" if _has_repository_semantics(data) else "session"
 
 
 @dataclass
@@ -46,6 +105,10 @@ class SubTask:
     acceptance: str = ""
     tool: str = ""
     context: str = ""
+    # 默认按可写任务处理，只有明确声明 read_only 才允许同层并发。
+    workspace_access: str = "write"
+    # session：中间产物目录；repository：用户启动 tasker 的代码仓库目录。
+    workdir_scope: str = "session"
     internal_loop: TaskLoop | None = None
 
 
@@ -74,6 +137,8 @@ class CompiledGraph:
     edges: list[GraphEdge] = field(default_factory=list)
     entry: str = ""
     finish: str = "__end__"
+    # 模板可选的阶段信息；不改变任务契约，只增加执行屏障和展示元数据。
+    workflow: list[dict] = field(default_factory=list)
 
     def node_by_id(self, node_id: str) -> Optional[SubTask]:
         for n in self.nodes:
@@ -86,10 +151,16 @@ class Session:
 
     session_id: str = ""
     goal: str = ""
-    status: str = "running"  # running | goal_achieved | failed | paused | stopped
+    status: str = "running"  # running | goal_achieved | failed | paused | stopped | deleted
     iteration: int = 0
     state: dict = field(default_factory=dict)  # 累计上下文：上轮输出/已确认验收点/产物清单
-    refs: dict = field(default_factory=dict)  # claude_session_id / codex_thread_id 供 resume
+    # 可选 runner 引用；当前恢复以 plan_signature/task_runs 的任务级检查点为准。
+    refs: dict = field(default_factory=dict)
+    # 当前已持久化计划的签名和任务快照，用于 /resume 跳过已成功任务。
+    plan_signature: str = ""
+    task_runs: dict[str, dict] = field(default_factory=dict)
+    deleted_at: str = ""
+    deleted_from_status: str = ""
     history: list[dict] = field(default_factory=list)
     created_at: str = ""
     updated_at: str = ""
@@ -134,6 +205,8 @@ class Event:
             return f"👤 注入消息 {body}"
         if self.kind == "interaction":
             return f"🔁 交互 {body}"
+        if self.kind == "retry":
+            return f"🔄 重试 {body}"
         if self.kind == "usage":
             return f"📊 用量 {body}"
         if self.kind == "error":
@@ -153,6 +226,8 @@ def subtask_to_dict(t: SubTask) -> dict:
         "acceptance": t.acceptance,
         "tool": t.tool,
         "context": t.context,
+        "workspace_access": t.workspace_access,
+        "workdir_scope": t.workdir_scope,
         "internal_loop": task_loop_to_dict(t.internal_loop),
     }
 
@@ -186,15 +261,26 @@ def task_loop_from_dict(value) -> TaskLoop | None:
 
 
 def subtask_from_dict(d: dict) -> SubTask:
+    if not isinstance(d, dict):
+        raise ValueError("任务必须是 JSON 对象")
+    raw_dependencies = d.get("depends_on", [])
+    if raw_dependencies is None:
+        raw_dependencies = []
+    if not isinstance(raw_dependencies, list) or not all(isinstance(item, str) for item in raw_dependencies):
+        raise ValueError("任务 depends_on 必须是字符串数组")
+    workspace_access = infer_workspace_access(d)
+    workdir_scope = infer_workdir_scope(d)
     return SubTask(
         id=str(d.get("id", "")),
         title=str(d.get("title", "")),
         description=str(d.get("description", "")),
         executor=str(d.get("executor", "claude")),
-        depends_on=list(d.get("depends_on") or []),
+        depends_on=list(raw_dependencies),
         acceptance=str(d.get("acceptance", "")),
         tool=str(d.get("tool", d.get("skill", "")) or ""),
         context=str(d.get("context", "")),
+        workspace_access=workspace_access,
+        workdir_scope=workdir_scope,
         internal_loop=task_loop_from_dict(d.get("internal_loop", d.get("loop"))),
     )
 
@@ -205,15 +291,36 @@ def graph_to_dict(g: CompiledGraph) -> dict:
         "edges": [{"src": e.src, "dst": e.dst} for e in g.edges],
         "entry": g.entry,
         "finish": g.finish,
+        "workflow": [dict(stage) for stage in g.workflow],
     }
 
 
 def graph_from_dict(d: dict) -> CompiledGraph:
+    if not isinstance(d, dict):
+        raise ValueError("任务图必须是 JSON 对象")
+    raw_nodes = d.get("nodes", [])
+    raw_edges = d.get("edges", [])
+    raw_workflow = d.get("workflow", [])
+    if raw_nodes is None:
+        raw_nodes = []
+    if raw_edges is None:
+        raw_edges = []
+    if raw_workflow is None:
+        raw_workflow = []
+    if not isinstance(raw_nodes, list) or not isinstance(raw_edges, list) or not isinstance(raw_workflow, list):
+        raise ValueError("任务图的 nodes、edges 和 workflow 必须是数组")
+    if not all(isinstance(node, dict) for node in raw_nodes):
+        raise ValueError("任务图 nodes 中存在非对象项")
+    if not all(isinstance(edge, dict) for edge in raw_edges):
+        raise ValueError("任务图 edges 中存在非对象项")
+    if not all(isinstance(stage, dict) for stage in raw_workflow):
+        raise ValueError("任务图 workflow 中存在非对象项")
     return CompiledGraph(
-        nodes=[subtask_from_dict(n) for n in (d.get("nodes") or [])],
-        edges=[GraphEdge(src=e.get("src", ""), dst=e.get("dst", "")) for e in (d.get("edges") or [])],
-        entry=d.get("entry", ""),
-        finish=d.get("finish", "__end__"),
+        nodes=[subtask_from_dict(n) for n in raw_nodes],
+        edges=[GraphEdge(src=str(e.get("src", "")), dst=str(e.get("dst", ""))) for e in raw_edges],
+        entry=str(d.get("entry", "") or ""),
+        finish=str(d.get("finish", "__end__") or "__end__"),
+        workflow=[dict(stage) for stage in raw_workflow],
     )
 
 
@@ -231,6 +338,13 @@ class TaskRun:
     cost_usd: float = 0.0
     raw_log_path: str = ""
     workdir: str = ""
+    # 每次执行尝试都有独立 ID；task.id 在故障转移和 /continue 中保持不变。
+    attempt_id: str = ""
+    parent_attempt_id: str = ""
+    failure_class: str = ""
+    retryable: bool = False
+    # 同一任务发生执行器故障转移时，按时间顺序保存每次尝试的摘要。
+    attempts: list[dict] = field(default_factory=list)
 
     @property
     def duration(self) -> float:
@@ -247,3 +361,156 @@ class TaskRun:
     @property
     def tool_events(self) -> list[Event]:
         return [e for e in self.events if e.kind in ("tool_use", "tool_result")]
+
+
+def task_run_to_dict(run: TaskRun) -> dict:
+    """保存可恢复任务所需的最小快照；事件正文仍由 JSONL 日志保存。"""
+    return {
+        "task": subtask_to_dict(run.task),
+        "status": run.status,
+        "output": run.output,
+        "exit_code": run.exit_code,
+        "error": run.error,
+        "started_at": run.started_at,
+        "ended_at": run.ended_at,
+        "cost_usd": run.cost_usd,
+        "raw_log_path": run.raw_log_path,
+        "workdir": run.workdir,
+        "attempt_id": run.attempt_id,
+        "parent_attempt_id": run.parent_attempt_id,
+        "failure_class": run.failure_class,
+        "retryable": run.retryable,
+        "attempts": [dict(item) for item in run.attempts],
+    }
+
+
+def task_run_from_dict(data: dict, task: SubTask | None = None) -> TaskRun:
+    if not isinstance(data, dict):
+        raise ValueError("任务运行快照必须是 JSON 对象")
+    saved_task = task or subtask_from_dict(data.get("task") or {})
+    raw_exit_code = data.get("exit_code")
+    raw_attempts = data.get("attempts", [])
+    if raw_attempts is None:
+        raw_attempts = []
+    if not isinstance(raw_attempts, list) or not all(isinstance(item, dict) for item in raw_attempts):
+        raise ValueError("任务运行快照的 attempts 必须是对象数组")
+    try:
+        exit_code = None if raw_exit_code is None else int(raw_exit_code)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("任务运行快照的 exit_code 非法") from exc
+    return TaskRun(
+        task=saved_task,
+        status=str(data.get("status", "pending")),
+        output=str(data.get("output", "") or ""),
+        exit_code=exit_code,
+        error=str(data.get("error", "") or ""),
+        started_at=float(data.get("started_at", 0.0) or 0.0),
+        ended_at=float(data.get("ended_at", 0.0) or 0.0),
+        cost_usd=float(data.get("cost_usd", 0.0) or 0.0),
+        raw_log_path=str(data.get("raw_log_path", "") or ""),
+        workdir=str(data.get("workdir", "") or ""),
+        attempt_id=str(data.get("attempt_id", "") or ""),
+        parent_attempt_id=str(data.get("parent_attempt_id", "") or ""),
+        failure_class=str(data.get("failure_class", "") or ""),
+        retryable=bool(data.get("retryable", False)),
+        attempts=[dict(item) for item in raw_attempts],
+    )
+
+
+def validate_graph(graph: CompiledGraph) -> None:
+    """验证从磁盘或外部 planner 得到的图，防止脏数据进入执行器。"""
+    if not isinstance(graph, CompiledGraph):
+        raise ValueError("任务图必须是 CompiledGraph")
+    if not isinstance(graph.nodes, list) or not isinstance(graph.edges, list):
+        raise ValueError("任务图的 nodes 和 edges 必须是数组")
+    ids: set[str] = set()
+    for node in graph.nodes:
+        if not isinstance(node, SubTask):
+            raise ValueError("任务图 nodes 中存在非 SubTask 项")
+        if not is_valid_id(node.id):
+            raise ValueError(f"任务 ID 非法: {node.id!r}")
+        if node.id in ids:
+            raise ValueError(f"任务 ID 重复: {node.id}")
+        ids.add(node.id)
+        if node.executor not in EXECUTORS:
+            raise ValueError(f"任务 {node.id} 的 executor 非法: {node.executor}")
+        if not isinstance(node.workspace_access, str) or node.workspace_access not in {"read_only", "write"}:
+            raise ValueError(f"任务 {node.id} 的 workspace_access 非法: {node.workspace_access}")
+        if not isinstance(node.workdir_scope, str) or node.workdir_scope not in {"session", "repository"}:
+            raise ValueError(f"任务 {node.id} 的 workdir_scope 非法: {node.workdir_scope}")
+        if not isinstance(node.description, str) or not node.description.strip():
+            raise ValueError(f"任务 {node.id} 缺少 description")
+        if not isinstance(node.depends_on, list) or not all(isinstance(item, str) for item in node.depends_on):
+            raise ValueError(f"任务 {node.id} 的 depends_on 必须是字符串数组")
+
+    for node in graph.nodes:
+        if len(node.depends_on) != len(set(node.depends_on)):
+            raise ValueError(f"任务 {node.id} 的 depends_on 存在重复项")
+        for dependency in node.depends_on:
+            if dependency not in ids:
+                raise ValueError(f"任务 {node.id} 依赖不存在的任务 {dependency}")
+            if dependency == node.id:
+                raise ValueError(f"任务 {node.id} 不能依赖自身")
+
+    if not isinstance(graph.entry, str) or not isinstance(graph.finish, str):
+        raise ValueError("任务图的 entry 和 finish 必须是字符串")
+    if graph.nodes and not graph.entry:
+        raise ValueError("非空任务图必须指定 entry")
+    if graph.entry and graph.entry not in ids:
+        raise ValueError(f"图入口不存在: {graph.entry}")
+
+    if not isinstance(graph.workflow, list) or not all(isinstance(stage, dict) for stage in graph.workflow):
+        raise ValueError("任务图 workflow 必须是对象数组")
+    workflow_tasks: set[str] = set()
+    workflow_stage_ids: set[str] = set()
+    for stage in graph.workflow:
+        stage_id = str(stage.get("id", "") or "")
+        raw_task_ids = stage.get("task_ids", [])
+        if not stage_id or stage_id in workflow_stage_ids:
+            raise ValueError(f"任务图 workflow 阶段 ID 非法或重复: {stage_id}")
+        if not isinstance(raw_task_ids, list) or not all(isinstance(task_id, str) for task_id in raw_task_ids):
+            raise ValueError(f"任务图 workflow 阶段 {stage_id} 的 task_ids 必须是字符串数组")
+        for task_id in raw_task_ids:
+            if task_id not in ids:
+                raise ValueError(f"任务图 workflow 引用不存在的任务: {task_id}")
+            if task_id in workflow_tasks:
+                raise ValueError(f"任务图 workflow 任务重复分配: {task_id}")
+            workflow_tasks.add(task_id)
+        workflow_stage_ids.add(stage_id)
+
+    seen_edges: set[tuple[str, str]] = set()
+    declared_dependencies = {(dependency, node.id) for node in graph.nodes for dependency in node.depends_on}
+    indegree = {node_id: 0 for node_id in ids}
+    adjacency = {node_id: [] for node_id in ids}
+    for edge in graph.edges:
+        if not isinstance(edge, GraphEdge) or not isinstance(edge.src, str) or not isinstance(edge.dst, str):
+            raise ValueError("任务图 edges 中存在非法边")
+        pair = (edge.src, edge.dst)
+        if edge.src not in ids or edge.dst not in ids:
+            raise ValueError(f"图边引用不存在的任务: {edge.src} -> {edge.dst}")
+        if edge.src == edge.dst:
+            raise ValueError(f"任务不能依赖自身: {edge.src}")
+        if pair in seen_edges:
+            raise ValueError(f"图边重复: {edge.src} -> {edge.dst}")
+        seen_edges.add(pair)
+        indegree[edge.dst] += 1
+        adjacency[edge.src].append(edge.dst)
+
+    # 计划节点的 depends_on 是对外声明，CompiledGraph.edges 是执行器实际使用的边。
+    # 无 depends_on 的旧版线性图仍可兼容；一旦显式声明依赖，两者必须完全一致。
+    if declared_dependencies and seen_edges != declared_dependencies:
+        missing = sorted(declared_dependencies - seen_edges)
+        extra = sorted(seen_edges - declared_dependencies)
+        raise ValueError(f"任务依赖声明与图边不一致: missing={missing}, extra={extra}")
+
+    ready = [node_id for node_id, degree in indegree.items() if degree == 0]
+    visited = 0
+    while ready:
+        current = ready.pop()
+        visited += 1
+        for nxt in adjacency[current]:
+            indegree[nxt] -= 1
+            if indegree[nxt] == 0:
+                ready.append(nxt)
+    if visited != len(ids):
+        raise ValueError("任务依赖存在环")
