@@ -11,7 +11,7 @@ from .config import Config
 from .graph_executor import GraphExecutor
 from .llm import LLMError
 from .models import CompiledGraph, Event, GraphEdge, Plan, Session, SubTask, TaskRun, task_run_to_dict
-from .planner import _extract_json, _validate, plan_with_llm, plan_with_rules
+from .planner import _extract_json, _validate, plan_with_llm, plan_with_single_code_agent
 from .session import SessionStore, graph_signature
 from .template_compiler import compile_template, load_named_template, validate_template_contract
 from .workflow import apply_workflow_barriers
@@ -476,8 +476,8 @@ class GoalLoop:
         try:
             return plan_with_llm(prompt, self.cfg, emit=emit, template=self.template)
         except LLMError as e:
-            console.warn(f"任务拆分 LLM 不可用（{e}），回退规则拆分")
-            return plan_with_rules(prompt, template=self.template)
+            console.warn(f"任务拆分 LLM 不可用（{e}），交给单个 code agent 执行完整目标")
+            return plan_with_single_code_agent(prompt, self.cfg, reason=str(e))
 
     def _execute(
         self,

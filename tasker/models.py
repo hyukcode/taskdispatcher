@@ -7,6 +7,8 @@ from typing import Optional
 from .formatting import compact_json as _compact
 
 EXECUTORS = ("claude", "codex", "human")
+WORKSPACE_ACCESS_MODES = ("read_only", "write")
+WORKDIR_SCOPES = ("session", "repository")
 EVENT_KINDS = (
     "thinking",            # 思维链 / 推理
     "text",                # 普通文本输出
@@ -40,49 +42,23 @@ def is_valid_id(value: object) -> bool:
     )
 
 
-def infer_workspace_access(data: dict) -> str:
-    """读取任务声明；未声明时仅把明显的纯阅读任务标成 read_only。"""
-    if "workspace_access" in data:
-        return str(data.get("workspace_access") or "write").strip().lower()
-    text = " ".join(str(data.get(key) or "") for key in ("title", "description", "tool", "acceptance")).lower()
-    read_words = ("读取", "阅读", "搜索", "检索", "调研", "研究", "查询", "分析", "总结", "比较", "read", "search", "research", "analy")
-    write_words = ("实现", "编写", "修改", "修复", "重构", "编辑", "落地", "开发", "写入", "删除", "implement", "edit", "fix", "refactor", "build")
-    if any(word in text for word in read_words) and not any(word in text for word in write_words):
-        return "read_only"
-    return "write"
+def resolve_workspace_access(data: dict) -> str:
+    """读取任务显式声明；缺失或非法值一律按 write 处理。"""
+    value = str(data.get("workspace_access") or "").strip().lower()
+    return value if value in WORKSPACE_ACCESS_MODES else "write"
 
 
-def _has_repository_semantics(data: dict) -> bool:
-    text = " ".join(
-        str(data.get(key) or "") for key in ("title", "description", "tool", "acceptance")
-    ).lower()
-    repository_words = (
-        "实现", "编写", "修改", "修复", "重构", "编辑", "开发", "落地", "代码", "脚本", "项目",
-        "仓库", "读取", "阅读", "提取", "分析", "调研", "研究", "搜索", "检索", "查询",
-        "评估", "总结", "比较", "对比", "方案", "设计", "交互", "架构", "结构", "规范",
-        "约定", "审查", "复核", "测试", "验证", "编译", "运行测试", "implement", "write",
-        "edit", "fix", "refactor", "develop", "code", "script", "project", "repository", "repo",
-        "read", "inspect", "extract", "analy", "research", "search", "query", "assess", "review",
-        "design", "interaction", "architecture", "spec", "test", "verify", "build", "compile",
-    )
-    return any(word in text for word in repository_words)
+def resolve_workdir_scope(data: dict) -> str:
+    """读取任务显式工作目录；缺失或非法值按 session 处理。
 
-
-def infer_workdir_scope(data: dict, *, enforce_repository_semantics: bool = False) -> str:
-    """推断任务应该操作 session workspace 还是用户代码仓库。
-
-    session workspace 只承载事件、日志和明确的中间产物。规划新任务时，
-    ``enforce_repository_semantics=True`` 会让读取、分析、调研、方案设计、
-    验证和代码任务优先落到 repository，即使 LLM 错误地返回了 session。
-    读取已保存会话时保持默认值 False，避免重新加载历史快照时改变其签名。
+    ``repository`` 布尔字段只作为旧模板格式的显式兼容字段，不参与文本推断。
     """
-    if enforce_repository_semantics and _has_repository_semantics(data):
-        return "repository"
-    if "workdir_scope" in data:
-        return str(data.get("workdir_scope") or "session").strip().lower()
+    value = str(data.get("workdir_scope") or "").strip().lower()
+    if value in WORKDIR_SCOPES:
+        return value
     if "repository" in data:
         return "repository" if bool(data.get("repository")) else "session"
-    return "repository" if _has_repository_semantics(data) else "session"
+    return "session"
 
 
 @dataclass
@@ -268,8 +244,8 @@ def subtask_from_dict(d: dict) -> SubTask:
         raw_dependencies = []
     if not isinstance(raw_dependencies, list) or not all(isinstance(item, str) for item in raw_dependencies):
         raise ValueError("任务 depends_on 必须是字符串数组")
-    workspace_access = infer_workspace_access(d)
-    workdir_scope = infer_workdir_scope(d)
+    workspace_access = resolve_workspace_access(d)
+    workdir_scope = resolve_workdir_scope(d)
     return SubTask(
         id=str(d.get("id", "")),
         title=str(d.get("title", "")),
@@ -434,9 +410,9 @@ def validate_graph(graph: CompiledGraph) -> None:
         ids.add(node.id)
         if node.executor not in EXECUTORS:
             raise ValueError(f"任务 {node.id} 的 executor 非法: {node.executor}")
-        if not isinstance(node.workspace_access, str) or node.workspace_access not in {"read_only", "write"}:
+        if not isinstance(node.workspace_access, str) or node.workspace_access not in WORKSPACE_ACCESS_MODES:
             raise ValueError(f"任务 {node.id} 的 workspace_access 非法: {node.workspace_access}")
-        if not isinstance(node.workdir_scope, str) or node.workdir_scope not in {"session", "repository"}:
+        if not isinstance(node.workdir_scope, str) or node.workdir_scope not in WORKDIR_SCOPES:
             raise ValueError(f"任务 {node.id} 的 workdir_scope 非法: {node.workdir_scope}")
         if not isinstance(node.description, str) or not node.description.strip():
             raise ValueError(f"任务 {node.id} 缺少 description")

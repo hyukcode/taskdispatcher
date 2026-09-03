@@ -16,8 +16,8 @@ from .models import (
     SubTask,
     graph_from_dict,
     graph_to_dict,
-    infer_workspace_access,
-    infer_workdir_scope,
+    resolve_workdir_scope,
+    resolve_workspace_access,
     task_loop_from_dict,
 )
 
@@ -87,13 +87,13 @@ def nodes_from_template(template: dict, default_executor: str = "codex") -> list
             SubTask(
                 id=tid,
                 title=str(t.get("title") or tid),
-                description=str(t.get("description") or ""),
+                description=str(t.get("description") or t.get("title") or ""),
                 executor=str(t.get("executor") or default_executor),
                 depends_on=[],
                 acceptance=str(t.get("acceptance") or ""),
                 tool=str(t.get("tool") or t.get("skill") or ""),
-                workspace_access=infer_workspace_access(t),
-                workdir_scope=infer_workdir_scope(t, enforce_repository_semantics=True),
+                workspace_access=resolve_workspace_access(t),
+                workdir_scope=resolve_workdir_scope(t),
                 internal_loop=task_loop_from_dict(t.get("internal_loop", t.get("loop"))),
             )
         )

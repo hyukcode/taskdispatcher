@@ -353,13 +353,13 @@ class Repl:
             console.warn("用法: /plan <目标>")
             return
         from .llm import LLMError
-        from .planner import plan_with_llm, plan_with_rules
+        from .planner import plan_with_llm, plan_with_single_code_agent
 
         try:
             plan = plan_with_llm(goal, self.cfg, emit=lambda e: None, template=self.template)
         except LLMError as e:
-            console.warn(f"拆分 LLM 不可用（{e}），用规则拆分")
-            plan = plan_with_rules(goal, template=self.template)
+            console.warn(f"拆分 LLM 不可用（{e}），交给单个 code agent 执行完整目标")
+            plan = plan_with_single_code_agent(goal, self.cfg, reason=str(e))
         print(f"目标: {plan.objective}")
         if plan.template:
             print(f"模板: {plan.template}")

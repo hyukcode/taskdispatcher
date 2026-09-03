@@ -16,7 +16,8 @@
 | 🛡️ 审批请求 | 权限拒绝、`permission_request`/`permission_result` 实时浮现；`approval` 策略可 auto/log/ask |
 | 💬 中途修改 | 运行中 `@claude/@codex/@all <消息>` 注入当前 SDK / App Server 会话 |
 | 🎯 依赖编排 | LLM 拆出依赖图 → 分层并发；上游输出自动作为下游上下文 |
-| 🧭 规则拆分 | `--plan-rules` 可跳过任务拆分 LLM，直接生成执行计划 |
+| 🧭 自适应拆分 | 有模板时按模板编排；无模板时用 ReAct 风格多轮拆分 |
+| 🛟 降级执行 | 拆分 LLM 不可用时，将完整目标交给一个 code agent 执行 |
 
 ---
 
@@ -95,7 +96,9 @@ prompt
   │  LLM API（anthropic / openai 兼容）
   ▼
 planner ──► Plan {tasks[], depends_on[], executor: claude|codex}
-  │            │  (规则拆分 plan_with_rules 作为无 key 回退)
+  │            ├─ 有模板：模板编排 LLM
+  │            ├─ 无模板：ReAct（候选 → 复核 → 收敛）
+  │            └─ LLM 不可用：单个 code agent 执行完整目标
   ▼
  GoalLoop（外层 goal 收敛）
    └─► GraphExecutor（按依赖分层，max_parallel 并发）
@@ -126,7 +129,7 @@ tasker/
   repl.py          REPL、session 生命周期和运行中输入路由
   goal_loop.py     外层 goal loop 与 session workspace
   graph_executor.py 依赖分层、并发、任务生命周期和审批接线
-  planner.py       LLM 拆分 + 规则回退 + 依赖校验/环检测
+  planner.py       模板编排 / ReAct 拆分 / 单 agent 降级 + 依赖校验/环检测
   sdk_runner.py    Claude Agent SDK 事件采集 + 会话注入 + 完成判定
   codex_app_server_runner.py  Codex App Server 事件采集 + thread/turn 注入
   live.py          LiveTui：实时打印 + 后台输入线程 + 指令解析
@@ -134,7 +137,7 @@ tasker/
   llm.py / config.py / spawn.py / models.py / console.py
 ```
 
-`SubTask.workspace_access` 可取 `read_only` 或 `write`。默认是 `write`；同层只有纯只读任务允许并发，避免多个 agent 同时覆盖文件。`SubTask.workdir_scope` 可取 `session` 或 `repository`：读取项目、调研、分析、方案设计、测试、验证和代码实现任务使用用户确认的 repository 目录；session workspace 只保存日志、事件和明确的中间产物。tasker 启动目录没有代码文件时，进入 REPL 前会询问仓库目录。
+`SubTask.workspace_access` 可取 `read_only` 或 `write`，由模板或规划 LLM 显式声明；缺失或非法值统一按 `write` 处理，不再根据关键词推断。同层只有纯只读任务允许并发，避免多个 agent 同时覆盖文件。`SubTask.workdir_scope` 可取 `session` 或 `repository`，也由模板或规划 LLM 显式声明；缺失或非法值统一按 `session` 处理，旧模板中的 `repository` 布尔字段仍作为兼容格式读取。`SubTask.executor` 同样只使用显式的 `claude`、`codex` 或 `human`，缺失或非法值使用配置默认 executor，不再根据任务文本改写。tasker 启动目录没有代码文件时，进入 REPL 前会询问仓库目录。
 
 ---
 
@@ -184,14 +187,14 @@ tasker/
 ## Codex App Server 的说明
 
 - Codex 任务使用持久 thread；`@codex` 注入通过 `turn/steer` 或新的 `turn/start` 进入当前任务。
-- 未安装或版本不支持 App Server 时，含 Codex 的任务会失败并给出错误；可用 `--plan-rules` 跳过拆分 LLM 先体验。
+- 未安装或版本不支持 App Server 时，含 Codex 的任务会失败并给出错误；拆分 LLM 不可用时会降级为单个 code agent 任务。
 
 ---
 
 ## 常见问题
 
 **任务拆分 LLM 报 401 / 网络错？**
-`llm` 段用独立 API key。若你的 `ANTHROPIC_API_KEY` 是 Claude Code 网关专用 key，无法直接访问 api.anthropic.com —— 设 `llm.base_url` 指向你的网关，或换 `provider=openai` + DeepSeek/Ollama。任何失败都会自动回退到规则拆分。
+`llm` 段用独立 API key。若你的 `ANTHROPIC_API_KEY` 是 Claude Code 网关专用 key，无法直接访问 api.anthropic.com —— 设 `llm.base_url` 指向你的网关，或换 `provider=openai` + DeepSeek/Ollama。拆分 LLM 失败时不会再猜测拆分，而是将完整目标交给一个 code agent。
 
 **headless 下"审批请求"不弹窗？**
 审批请求会进入 Tasker 的统一事件流；`approval.mode=ask_console` 时，在当前 REPL 终端输入 `:allow` 或 `:deny`。

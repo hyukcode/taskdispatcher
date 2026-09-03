@@ -2,68 +2,54 @@
 from __future__ import annotations
 
 import json
-import logging
 
 from . import console
 from .config import Config
 from .formatting import extract_json_object
 from .llm import LLMError, chat
-from .models import Event, Plan, SubTask, infer_workspace_access, infer_workdir_scope, is_valid_id, task_loop_from_dict
+from .models import (
+    EXECUTORS,
+    WORKSPACE_ACCESS_MODES,
+    WORKDIR_SCOPES,
+    Event,
+    Plan,
+    SubTask,
+    is_valid_id,
+    resolve_workspace_access,
+    resolve_workdir_scope,
+    task_loop_from_dict,
+)
 from .tool_catalog import ToolCatalog
 from .workflow import normalize_workflow
 
 
-logger = logging.getLogger(__name__)
+REACT_SYSTEM_PROMPT = """\
+你是一个采用 ReAct 风格进行任务规划的多智能体任务编排器。
+你只负责规划，不执行代码、不调用外部工具，也不要输出思维链；每一轮只输出严格 JSON，
+其中 observation 只写简短、可审计的规划结论。
 
-SYSTEM_PROMPT = """\
-你是一个多智能体任务编排器。用户会给你一个目标，请把它拆分为若干个可并行/串行的子任务，
-并分派给 claude（擅长代码实现、文件编辑、整体工程）、codex（擅长推理、测试、批处理）或 human（人工审查点）。
+规划动作分三步：
+1. decompose：把总体目标拆成最小的、可独立验收的任务；
+2. review：检查遗漏、依赖关系、并行机会、executor 分配和验收标准，并给出修订后的完整 tasks；
+3. finalize：根据候选任务和复核结果收敛为最终任务图。
+
+最终 tasks 必须使用以下字段：
+{"id":"t1","title":"…","description":"可被单独交给 agent 执行的详细指令",
+ "tool":"可选工具或 skill","executor":"claude|codex|human","depends_on":[],
+ "workspace_access":"read_only|write","workdir_scope":"session|repository",
+ "acceptance":"完成标准","internal_loop":{"enabled":false,"max_iterations":5,"exit_condition":""}}
+
 要求：
-- 每个子任务依赖其它子任务时，用 depends_on 声明（引用其它任务的 id）。
-- 让互相独立的子任务尽量并行（分给不同的 executor）。
-- workdir_scope=repository 用于读取项目、调研、分析、方案设计、测试、验证和代码实现；workdir_scope=session 只用于日志、事件和明确的中间产物。
-- 输出严格 JSON（不要 markdown 代码块），格式：
-{
-  "objective": "目标一句话",
-  "rationale": "为什么这样拆分，一句话",
-  "template": "使用的模板名（未使用模板则为 null）",
-  "tasks": [
-    {"id":"t1","title":"…","description":"详细指令，可被单独交给一个 agent 执行","tool":"可选工具或 skill","executor":"claude|codex|human","depends_on":[],"workspace_access":"read_only|write","workdir_scope":"session|repository","acceptance":"完成标准","internal_loop":{"enabled":false,"max_iterations":5,"exit_condition":""}}
-  ]
-}
-- 只输出 JSON。id 从 t1 开始递增。
-
-人工审查点（executor:"human"）识别规则：
-若某一步骤满足以下任一条件，应把其 executor 设为 "human"（人工审查点，会阻塞等待用户决定）：
-1. 涉及对外发布、部署到生产、提交到主分支、删除数据等不可逆/高风险操作；
-2. 关键决策点（技术选型、方案定稿、是否上线的拍板）；
-3. 需要人核对产出是否正确/是否符合预期（最终验收、内容审校、上线前检查）。
-其它步骤在 claude / codex 中二选一。human 步骤的 description 写清「审查什么」，
-acceptance 写清「通过标准」。
+- id 从 t1 开始递增；
+- 互相独立的任务尽量并行，有先后关系才填写 depends_on；
+- 代码实现、文件编辑优先 claude；分析、调研、测试、验证优先 codex；
+- 发布、生产部署、删除数据、提交主分支和最终验收等高风险步骤使用 human；
+- 读取项目、调研、分析、方案设计、测试、验证和代码实现使用 workdir_scope=repository；
+- 每个任务必须有非空 description 和 acceptance；
+- workspace_access 必须显式填写；无法确定时填写 write，不要根据文字自行推断；
+- review/finalize 阶段必须返回完整 tasks，不能只返回修改项；
+- 不要新增无法从目标推导出的工作，也不要把整个目标重复塞进多个任务。
 """
-
-_TPL_KNOWN_FIELDS = frozenset({
-    "template_name",
-    "source_file",
-    "system_prompt_extension",
-    "suggested_tasks",
-    "workflow",
-    "workflow_stages",
-})
-
-_TASK_KNOWN_FIELDS = frozenset({
-    "title",
-    "description",
-    "executor",
-    "depends_on",
-    "acceptance",
-    "tool",
-    "skill",
-    "workspace_access",
-    "workdir_scope",
-    "internal_loop",
-    "loop",
-})
 
 
 def _dispatch_profile_text(cfg: Config) -> str:
@@ -105,46 +91,13 @@ _TEMPLATE_ORCHESTRATION_PROMPT = """\
 """
 
 
-def _fallback_executor(task: dict, cfg: Config) -> str:
-    text = " ".join(
-        str(task.get(k) or "") for k in ("title", "description", "tool", "acceptance")
-    ).lower()
-    if any(k in text for k in ("发布", "部署到生产", "删除数据", "提交主分支", "上线", "approve")):
-        return "human"
-    if any(k in text for k in (
-        "读取", "阅读", "提取", "分析", "计划", "查询", "查找", "搜索", "检索", "测试", "验证",
-        "评估", "调研", "研究", "总结", "比较", "indexer", "research", "analy", "search", "test",
-    )):
-        return cfg.dispatch.complex_executor
-    if any(k in text for k in (
-        "实现", "编写", "修改", "修复", "重构", "编辑", "落地", "开发", "增加", "删除",
-        "implement", "edit", "fix", "refactor", "build",
-    )):
-        return cfg.dispatch.implementation_executor
-    return cfg.dispatch.complex_executor
-
-
-def _enforce_executor(task: dict, proposed: str, cfg: Config) -> str:
-    text = " ".join(
-        str(task.get(k) or "") for k in ("title", "description", "tool", "acceptance")
-    ).lower()
-    if any(k in text for k in ("发布", "部署到生产", "删除数据", "提交主分支", "上线", "approve")):
-        return "human"
-    if proposed == "human":
-        return "human"
-    if any(k in text for k in (
-        "实现", "编写", "修改", "修复", "重构", "编辑", "落地", "开发", "增加",
-        "implement", "edit", "fix", "refactor", "build",
-    )):
-        return cfg.dispatch.implementation_executor
-    if any(k in text for k in (
-        "读取", "阅读", "提取", "分析", "计划", "查询", "查找", "搜索", "检索", "测试", "验证",
-        "评估", "调研", "研究", "总结", "比较", "indexer", "research", "analy", "search", "test",
-    )):
-        return cfg.dispatch.complex_executor
-    if proposed in ("claude", "codex"):
-        return proposed
-    return cfg.dispatch.complex_executor
+def resolve_executor(value: object, cfg: Config) -> str:
+    """读取任务显式 executor；缺失或非法值使用配置中的默认 executor。"""
+    normalized = str(value or "").strip().lower()
+    if normalized in EXECUTORS:
+        return normalized
+    default = str(getattr(cfg.dispatch, "complex_executor", "codex") or "codex").strip().lower()
+    return default if default in EXECUTORS else "codex"
 
 
 def _normalize_loop_info(data: dict, ids: set[str]) -> dict:
@@ -217,53 +170,13 @@ def _extract_json(text: str) -> dict:
         raise LLMError(f"LLM 返回内容中没有合法 JSON 对象: {exc}") from exc
 
 
-def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) -> Plan:
-
-    if template is None:
-        template = _auto_match_template(prompt)
-    if template and template.get("suggested_tasks"):
-        template = dict(template)
-        template.pop("_meta", None)
-        try:
-            allocation, raw = _template_orchestration(prompt, cfg, template, emit)
-            plan = _plan_from_template(prompt, template, allocation=allocation, raw_llm_output=raw, cfg=cfg)
-            _validate(plan)
-            return plan
-        except (LLMError, json.JSONDecodeError, ValueError, KeyError) as e:
-            console.warn(f"模板编排 LLM 失败（{e}），使用 Codex-first 能力分配")
-            fallback = _plan_from_template(prompt, template, cfg=cfg)
-            _validate(fallback)
-            return fallback
-
-    sys_prompt = SYSTEM_PROMPT + "\n\n" + _dispatch_profile_text(cfg)
-    user_content = f"目标：\n{prompt}"
-
-    if not template:
-        catalog = _load_catalog()
-        if catalog:
-            sys_prompt += (
-                "\n\n## 可用模板目录\n"
-                "以下是本地已存储的任务拆解模板。如果当前目标与某个模板相关，"
-                "请参考其任务结构进行拆分（可以调整、合并或增删）：\n\n"
-                + catalog
-            )
-
-    if template:
-        sys_prompt, user_content = _inject_template(sys_prompt, user_content, template, cfg=cfg)
-
-    messages = [
-        {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": user_content},
-    ]
-    emit(Event(kind="interaction", source="planner", text="调用任务拆分 LLM（模型 " + cfg.llm.model + "）"))
-    raw = chat(cfg.llm, messages, temperature=0.0)
-    data = _extract_json(raw)
+def _plan_from_llm_data(prompt: str, cfg: Config, data: dict, raw: str) -> Plan:
+    """把通用规划 LLM 的结构化结果统一转换为 Plan。"""
     raw_tasks = data.get("tasks", [])
     if not isinstance(raw_tasks, list):
         raise LLMError("任务拆分结果的 tasks 必须是数组")
     tasks = []
     seen: set[str] = set()
-    raw_dependencies: list[list[str]] = []
     for i, t in enumerate(raw_tasks, start=1):
         if not isinstance(t, dict):
             raise LLMError(f"任务 t{i} 必须是 JSON 对象")
@@ -271,7 +184,7 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
         if tid in seen:
             raise LLMError(f"任务 ID 重复: {tid}")
         seen.add(tid)
-        executor = _enforce_executor(t, str(t.get("executor") or ""), cfg)
+        executor = resolve_executor(t.get("executor"), cfg)
         raw_deps = t.get("depends_on", [])
         if raw_deps is None:
             raw_deps = []
@@ -279,8 +192,8 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
             raise LLMError(f"任务 {tid} 的 depends_on 必须是数组")
         deps = [str(d) for d in raw_deps]
         tool = str(t.get("tool") or t.get("skill") or "")
-        workspace_access = infer_workspace_access(t)
-        workdir_scope = infer_workdir_scope(t, enforce_repository_semantics=True)
+        workspace_access = resolve_workspace_access(t)
+        workdir_scope = resolve_workdir_scope(t)
         tasks.append(
             SubTask(
                 id=tid,
@@ -295,9 +208,6 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
                 internal_loop=task_loop_from_dict(t.get("internal_loop", t.get("loop"))),
             )
         )
-        raw_dependencies.append(deps)
-    for task, deps in zip(tasks, raw_dependencies):
-        task.depends_on = deps
     tpl_name = data.get("template")
     if not isinstance(tpl_name, str) or not tpl_name.strip() or tpl_name.lower() == "null":
         tpl_name = None
@@ -305,13 +215,120 @@ def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) 
         tpl_name = tpl_name.strip()
     plan = Plan(
         objective=str(data.get("objective") or prompt[:120]),
-        rationale=str(data.get("rationale") or ""),
+        rationale=str(data.get("rationale") or data.get("observation") or ""),
         tasks=tasks,
         raw_llm_output=raw,
         template=tpl_name,
     )
     _validate(plan)
     return plan
+
+
+def _react_step(cfg: Config, system: str, instruction: str, phase: str) -> tuple[dict, str]:
+    """执行一个 ReAct 规划阶段，并确保阶段返回完整任务列表。"""
+    raw = chat(
+        cfg.llm,
+        [
+            {"role": "system", "content": system},
+            {"role": "user", "content": instruction},
+        ],
+        temperature=0.0,
+    )
+    data = _extract_json(raw)
+    if not isinstance(data.get("tasks"), list) or not data.get("tasks"):
+        raise LLMError(f"ReAct {phase} 没有返回完整 tasks")
+    return data, raw
+
+
+def plan_with_react(prompt: str, cfg: Config, emit) -> Plan:
+    """无模板时用多轮结构化 ReAct 规划，避免一次性生成未经复核的任务图。"""
+    system = REACT_SYSTEM_PROMPT + "\n\n" + _dispatch_profile_text(cfg)
+    emit(Event(kind="interaction", source="planner", text="ReAct 拆分：分析目标并生成候选任务"))
+    draft, _ = _react_step(
+        cfg,
+        system,
+        f"动作：decompose\n总体目标：\n{prompt}",
+        "decompose",
+    )
+
+    emit(Event(kind="interaction", source="planner", text="ReAct 拆分：复核依赖、并行关系和验收标准"))
+    review, _ = _react_step(
+        cfg,
+        system,
+        (
+            "动作：review\n"
+            f"总体目标：\n{prompt}\n\n"
+            "候选计划：\n"
+            f"{json.dumps(draft, ensure_ascii=False)[:12000]}\n\n"
+            "检查遗漏、依赖、并行机会、executor、工作目录和验收标准，返回修订后的完整 tasks。"
+        ),
+        "review",
+    )
+
+    emit(Event(kind="interaction", source="planner", text="ReAct 拆分：收敛最终任务图"))
+    final, final_raw = _react_step(
+        cfg,
+        system,
+        (
+            "动作：finalize\n"
+            f"总体目标：\n{prompt}\n\n"
+            "候选计划：\n"
+            f"{json.dumps(draft, ensure_ascii=False)[:9000]}\n\n"
+            "复核后的计划：\n"
+            f"{json.dumps(review, ensure_ascii=False)[:12000]}\n\n"
+            "请只返回最终完整任务图，保留必要任务，修正依赖和验收标准。"
+        ),
+        "finalize",
+    )
+    return _plan_from_llm_data(prompt, cfg, final, final_raw)
+
+
+def plan_with_single_code_agent(prompt: str, cfg: Config, *, reason: str = "") -> Plan:
+    """拆分 LLM 不可用时，不再猜测拆分，交给一个代码 agent 完成整个目标。"""
+    executor = cfg.dispatch.implementation_executor
+    if executor not in ("claude", "codex"):
+        executor = "claude"
+    suffix = f"\n\n拆分器状态：{reason}" if reason else ""
+    task = SubTask(
+        id="t1",
+        title="执行完整目标",
+        description=(
+            f"请直接完成以下总体目标：\n{prompt}\n\n"
+            "请先检查当前代码仓库和已有实现，制定必要的内部步骤并直接落地；"
+            "完成后运行适当的测试或验证，并汇报实际产出。"
+            f"{suffix}"
+        ),
+        executor=executor,
+        workspace_access="write",
+        workdir_scope="repository",
+        acceptance="总体目标已完成，代码/文件已落地，并提供必要的测试或验证结果",
+    )
+    plan = Plan(
+        objective=prompt[:120],
+        rationale=f"拆分 LLM 不可用，整个目标交给 {executor} 执行",
+        tasks=[task],
+    )
+    _validate(plan)
+    return plan
+
+
+def plan_with_llm(prompt: str, cfg: Config, emit, template: dict | None = None) -> Plan:
+
+    if template is None:
+        template = _auto_match_template(prompt)
+    if template and template.get("suggested_tasks"):
+        template = dict(template)
+        template.pop("_meta", None)
+        try:
+            allocation, raw = _template_orchestration(prompt, cfg, template, emit)
+            plan = _plan_from_template(prompt, template, allocation=allocation, raw_llm_output=raw, cfg=cfg)
+            _validate(plan)
+            return plan
+        except (LLMError, json.JSONDecodeError, ValueError, KeyError) as e:
+            raise LLMError(f"模板编排 LLM 不可用: {e}") from e
+
+    if not template or not template.get("suggested_tasks"):
+        return plan_with_react(prompt, cfg, emit)
 
 
 def _auto_match_template(prompt: str) -> dict | None:
@@ -370,150 +387,6 @@ def _keyword_runs(
     return result
 
 
-def _load_catalog() -> str:
-    try:
-        from template import catalog_for_llm
-
-        return catalog_for_llm()
-    except ImportError:
-        return ""
-    except Exception:
-        logger.debug("加载模板目录失败", exc_info=True)
-        return ""
-
-
-def _inject_template(sys_prompt: str, user_content: str, template: dict, cfg: Config | None = None) -> tuple[str, str]:
-
-    import json as _json
-
-    tpl_name = template.get("template_name", "未命名模板")
-    ext = template.get("system_prompt_extension", "")
-    suggested = template.get("suggested_tasks") or []
-    passthrough = {k: v for k, v in template.items() if k not in _TPL_KNOWN_FIELDS}
-
-    parts = [f"## 必用模板：{tpl_name}"]
-
-    if cfg is not None:
-        parts.append("\n" + _dispatch_profile_text(cfg))
-
-    if ext:
-        parts.append(f"\n### 模板说明\n{ext[:2000]}")
-
-    workflow = template.get("workflow", template.get("workflow_stages"))
-    if workflow:
-        parts.append(
-            "\n### 可选阶段工作流（只控制执行顺序和阶段展示，不得改写任务契约）\n"
-            + _json.dumps(workflow, ensure_ascii=False)[:2500]
-        )
-
-    if suggested:
-        parts.append("\n### 模板任务清单（必须严格遵循，任务数量与标题不得增删）")
-        for i, t in enumerate(suggested, start=1):
-            tid = t.get("id", f"t{i}")
-            title = t.get("title", "")
-            desc = t.get("description", "")
-            acceptance = t.get("acceptance", "")
-            tool = t.get("tool") or t.get("skill") or ""
-            workspace_access = infer_workspace_access(t)
-            workdir_scope = infer_workdir_scope(t, enforce_repository_semantics=True)
-            parts.append(
-                f"  {tid}: {title}\n"
-                f"    描述: {desc[:500]}\n"
-                f"    工具/技能: {tool or '—'}\n"
-                f"    工作区访问: {workspace_access}\n"
-                f"    工作目录: {workdir_scope}\n"
-                f"    验收: {acceptance or '—'}"
-            )
-            # 透传 suggested_tasks 中的未知字段
-            extra = {k: v for k, v in t.items() if k not in _TASK_KNOWN_FIELDS}
-            if extra:
-                parts.append(f"    元信息: {_json.dumps(extra, ensure_ascii=False)}")
-
-    if passthrough:
-        parts.append(
-            f"\n### 模板附加约束\n{_json.dumps(passthrough, ensure_ascii=False, indent=2)[:1500]}"
-        )
-
-    parts.append(
-        "\n**重要约束：你必须以上述模板的任务清单为蓝本进行拆分，保留模板的总体目标、任务 id、"
-        "标题、描述、验收标准和工作目录约束，不得增删任务或改写这些内容。**\n"
-        "**模板中的 tool/skill 只是任务所需工具提示，可以根据当前 executor 实际可用能力保留、替换或留空；模板不指定 executor（由 claude 还是 codex 执行）与 depends_on（任务间依赖）："
-        "请你根据每个任务的性质（如代码实现、测试、调研等）自行分配合适的 executor，"
-        "并根据任务间的逻辑先后关系自行填写 depends_on。**"
-    )
-
-    sys_prompt += "\n\n" + "\n".join(parts)
-    return sys_prompt, user_content
-
-
-def _rule_split(prompt: str) -> list[SubTask]:
-    low = prompt.lower()
-    tasks: list[SubTask] = []
-
-    has_code = any(w in low for w in ("代码", "写", "实现", "修复", "bug", "重构", "test", "测试", "build", "函数", "脚本"))
-    has_research = any(w in low for w in ("分析", "研究", "搜索", "调研", "web", "找资料", "调查", "比较", "对比", "阅读", "检索", "评估", "方案", "架构"))
-
-    research_id = ""
-    if has_research:
-        research_id = f"t{len(tasks) + 1}"
-        tasks.append(SubTask(id=research_id, title="调研与资料收集", description=prompt + "\n\n请先在当前代码仓库中完成调研：阅读项目文件并整理相关资料，输出要点与来源。", executor="codex", workspace_access="read_only", workdir_scope="repository"))
-
-    if has_code:
-        design_id = f"t{len(tasks) + 1}"
-        tasks.append(
-            SubTask(
-                id=design_id,
-                title="方案设计",
-                description=f"为以下目标做技术方案设计（模块划分、接口、依赖）：\n{prompt}",
-                executor="codex",
-                workdir_scope="repository",
-                depends_on=[research_id] if research_id else [],
-            )
-        )
-        implementation_id = f"t{len(tasks) + 1}"
-        tasks.append(
-            SubTask(
-                id=implementation_id,
-                title="代码实现",
-                description=f"按方案实现：\n{prompt}\n\n直接在当前工作目录中编写并落地代码。",
-                executor="claude",
-                workdir_scope="repository",
-                depends_on=[design_id],
-            )
-        )
-        tasks.append(
-            SubTask(
-                id=f"t{len(tasks) + 1}",
-                title="测试与验证",
-                description="对刚实现的代码编写/运行测试，验证功能正确，报告结果。",
-                executor="codex",
-                workdir_scope="repository",
-                depends_on=[implementation_id],
-            )
-        )
-    elif not tasks:
-        tasks.append(SubTask(id="t1", title="执行目标", description=prompt + "\n\n在当前工作目录中完成上述目标，并汇报结果。", executor="codex"))
-    return tasks
-
-
-def plan_with_rules(prompt: str, template: dict | None = None) -> Plan:
-    if template is None:
-        template = _auto_match_template(prompt)
-    if template and template.get("suggested_tasks"):
-        plan = _plan_from_template(prompt, template)
-        _validate(plan)
-        return plan
-    tasks = _rule_split(prompt)
-    plan = Plan(
-        objective=prompt[:120],
-        rationale="规则拆分（未调用 LLM）",
-        tasks=tasks,
-        raw_llm_output="",
-    )
-    _validate(plan)
-    return plan
-
-
 def _normalize_task_allocation(data: dict, ids: set[str]) -> tuple[dict[str, dict], dict]:
     allocations: dict[str, dict] = {}
     for item in data.get("tasks") or []:
@@ -524,7 +397,7 @@ def _normalize_task_allocation(data: dict, ids: set[str]) -> tuple[dict[str, dic
             continue
         row: dict = {}
         executor = str(item.get("executor", ""))
-        if executor in ("claude", "codex", "human"):
+        if executor in EXECUTORS:
             row["executor"] = executor
         if "depends_on" in item:
             deps = item.get("depends_on") or []
@@ -564,11 +437,7 @@ def _plan_from_template(
     for i, t in enumerate(suggested):
         tid = str(t.get("id") or f"t{i + 1}")
         selected = allocation_map.get(tid, {})
-        executor = _enforce_executor(
-            t,
-            str(selected.get("executor") or t.get("executor") or ""),
-            effective_cfg,
-        )
+        executor = resolve_executor(selected.get("executor") or t.get("executor"), effective_cfg)
         if "depends_on" in selected:
             deps = selected["depends_on"]
         else:
@@ -586,8 +455,8 @@ def _plan_from_template(
             depends_on=deps,
             acceptance=str(t.get("acceptance") or ""),
             tool=tool,
-            workspace_access=infer_workspace_access(t),
-            workdir_scope=infer_workdir_scope(t, enforce_repository_semantics=True),
+            workspace_access=resolve_workspace_access(t),
+            workdir_scope=resolve_workdir_scope(t),
             internal_loop=task_loop_from_dict(loop_value),
         ))
 
@@ -616,7 +485,7 @@ def _plan_from_template(
             f"模板拆分 + {effective_cfg.dispatch.strategy} 编排 "
             f"（来源: {template.get('source_file', '?')}）"
         ),
-        tasks=tasks or _rule_split(prompt),
+        tasks=tasks,
         raw_llm_output=raw_llm_output,
         template=template.get("template_name"),
         orchestration={
@@ -644,11 +513,11 @@ def _validate(plan: Plan) -> None:
     for t in plan.tasks:
         if not is_valid_id(t.id):
             raise LLMError(f"任务 {t.id!r} 的 ID 只能包含字母、数字、下划线和连字符，且不能以符号开头")
-        if t.executor not in ("claude", "codex", "human"):
+        if t.executor not in EXECUTORS:
             raise LLMError(f"任务 {t.id} 的 executor 非法: {t.executor}")
-        if t.workspace_access not in ("read_only", "write"):
+        if t.workspace_access not in WORKSPACE_ACCESS_MODES:
             raise LLMError(f"任务 {t.id} 的 workspace_access 非法: {t.workspace_access}")
-        if t.workdir_scope not in ("session", "repository"):
+        if t.workdir_scope not in WORKDIR_SCOPES:
             raise LLMError(f"任务 {t.id} 的 workdir_scope 非法: {t.workdir_scope}")
         if not isinstance(t.depends_on, list) or not all(isinstance(dep, str) for dep in t.depends_on):
             raise LLMError(f"任务 {t.id} 的 depends_on 必须是字符串数组")
