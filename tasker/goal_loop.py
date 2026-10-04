@@ -515,6 +515,7 @@ class GoalLoop:
             repository_dir=self.repository_dir,
             resume_runs=resume_runs,
             on_task_complete=on_task_complete,
+            session_id=session.session_id,
         )
         self.current = ex
         try:

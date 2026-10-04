@@ -19,6 +19,8 @@ from .runner_base import RunnerBase
 from .runner_factory import create_runner
 from .tool_catalog import ToolCatalog
 from .workflow import stage_for_task
+from .domain.execution import TaskExecution
+from .domain.state_machine import TaskStatus
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,7 @@ class GraphExecutor:
         on_task_complete=None,
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
+        session_id: str = "",
     ):
         self.cfg = cfg
         self.graph = graph
@@ -94,6 +97,10 @@ class GraphExecutor:
         self._quit = threading.Event()
         self._active: dict[str, RunnerBase] = {}
         self._active_lock = threading.Lock()
+        self.session_id = session_id
+        self.execution_history: dict[
+            str, list[TaskExecution]
+        ] = {}
 
     @staticmethod
     def _default_emit(run: TaskRun | None, event: Event) -> None:
@@ -359,6 +366,17 @@ class GraphExecutor:
         return min(maximum, initial * (2 ** exponent))
 
     def _run_code_node_with_failover(self, node: SubTask, extra_context: str = "") -> TaskRun:
+
+        execution = TaskExecution(
+            session_id = self.session_id,
+            task=node,
+        )
+        execution.mark_ready()
+        with self._runs_lock:
+            self.execution_history.setdefault(
+                node.id, []
+            ).append(execution)
+
         executors = self._failover_executors(node.executor)
         attempts: list[dict] = []
         final_run: TaskRun | None = None
@@ -396,12 +414,48 @@ class GraphExecutor:
                         )
                     context = f"{context}\n\n{transition_context}" if context else transition_context
 
+                if execution.status == TaskStatus.FAILED:
+                    execution.mark_ready()
+                attempt = execution.start_attempt(
+                    executor=executor,
+                    attempt_id=attempt_id,
+                )
                 with self._runs_lock:
-                    self._attempt_context[node.id] = (attempt_id, parent_attempt_id)
-                final_run = self._run_code_node(attempt_node, context)
-                with self._runs_lock:
-                    self._attempt_context.pop(node.id, None)
-                failure_class = self._classify_failure(final_run, stopped=self._quit.is_set())
+                    self._attempt_context[node.id] = (
+                        attempt.id,
+                        attempt.parent_attempt_id,
+                    )
+                try: 
+                    final_run = self._run_code_node(
+                        attempt_node,
+                        context,
+                    )
+                except Exception as exc:
+                    execution.finish_attempt(
+                        success=False,
+                        error=str(exc),
+                        failure_class="orchestrator_error",
+                    )
+                    raise
+                finally:
+                    with self._runs_lock:
+                        self._attempt_context.pop(node.id, None)
+                
+                failure_class = self._classify_failure(
+                    final_run, 
+                    stopped=self._quit.is_set(),
+                )
+
+                execution.finish_attempt(
+                    success=final_run.status == "success",
+                    output=final_run.output,
+                    error=final_run.error,
+                    exit_code=final_run.exit_code,
+                    failure_class=failure_class,
+                    cost_used=final_run.cost_usd,
+                )
+
+
                 retryable = failure_class in _SAME_EXECUTOR_RETRY_FAILURES
                 final_run.attempt_id = attempt_id
                 final_run.parent_attempt_id = parent_attempt_id

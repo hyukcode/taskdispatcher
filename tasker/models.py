@@ -72,11 +72,10 @@ class TaskLoop:
 
 @dataclass
 class SubTask:
-
     id: str
     title: str
     description: str
-    executor: str = "claude"
+    executor: str = "codex"
     depends_on: list[str] = field(default_factory=list)
     acceptance: str = ""
     tool: str = ""
