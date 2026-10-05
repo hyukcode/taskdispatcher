@@ -20,6 +20,7 @@ CHECKPOINT_STATUSES = frozenset({
     "started",
     "success",
     "failed",
+    "abandoned",
 })
 
 @dataclass(frozen=True)
@@ -103,19 +104,113 @@ class CheckpointStore:
         return checkpoint
 
     def load(
-        self, session_id: str, task_id: str, attempt_id: str,
+        self, 
+        session_id: str, 
+        task_id: str, 
+        attempt_id: str,
     ) -> AttemptCheckpoint | None:
+
         path = self._path(session_id, task_id, attempt_id)
+
         with self._lock:
             if not path.exists():
                 return None
             data = json.loads(path.read_text(encoding="utf-8"))
+
         cp = AttemptCheckpoint(**data)
-        if (cp.version != 1 or cp.status not in {"started", "success", "failed"}
+
+        if (
+            cp.version != CHECKPOINT_VERSION 
+            or cp.status not in CHECKPOINT_STATUSES
             or (cp.session_id, cp.task_id, cp.attempt_id)
             != (session_id, task_id, attempt_id)):
             raise ValueError(f"损坏的检查点: {path}")
         return cp
+    
+    # 幂等
+    def abandon_for_retry(
+        self,
+        session_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        reason: str,
+    ) -> AttemptCheckpoint:
+
+        with self._lock:
+            current = self.load(
+                session_id,
+                task_id,
+                attempt_id,
+            )
+
+            if current is None:
+                raise FileNotFoundError(attempt_id)
+
+            if current.status == "abandoned":
+                return current
+
+            if current.status not in {
+                "started",
+                "failed",
+            }:
+                raise CheckpointConflict(
+                    "只有 started / failed attempt "
+                    "才能确认后重新执行"
+                )
+            updated = replace(
+                current,
+                status="abandoned",
+                ended_at=time.time(),
+                error=reason or (
+                   "operator confirmed safe to retry" 
+                ),
+            )
+
+            self._atomic_write(
+                self._path(
+                    session_id,
+                    task_id,
+                    attempt_id,
+                ),
+                updated,
+            )
+
+            return updated
+
+    def allow_retry(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        reason: str = "",
+    ) -> AttemptCheckpoint:
+        checkpoint = self.store.load(
+            self.session_id,
+            task_id,
+            attempt_id,
+        )
+        if checkpoint is None:
+            raise FileNotFoundError(attempt_id)
+        if checkpoint.plan_signature != self.plan_signature:
+            raise RecoveryBlocked(
+                [
+                    RecoveryIssue(
+                        task_id=task_id,
+                        reason="PLAN_CHANGED",
+                        attempt_ids=(
+                            attempt_id,
+                        ),
+                    )
+                ]
+            )
+        return self.store.abandon_for_retry(
+            self.session_id,
+            task_id,
+            attempt_id,
+            reason=reason,
+        )
+
 
     def finish(
         self, session_id: str, task_id: str, attempt_id: str,
@@ -169,8 +264,11 @@ class CheckpointStore:
         return "REVIEW_BEFORE_RETRY"
 
     def recovery_decision(
-        self, session_id: str, task_id: str,
-        attempt_id: str, plan_signature: str,
+        self, 
+        session_id: str, 
+        task_id: str,
+        attempt_id: str, 
+        plan_signature: str,
     ) -> str:
         cp = self.load(session_id, task_id, attempt_id)
         if cp is None:
@@ -181,4 +279,5 @@ class CheckpointStore:
             "started": "RECOVERY_REQUIRED",
             "success": "REUSE_RESULT",
             "failed": "REVIEW_BEFORE_RETRY",
+            "abandoned": "RETRY_ALLOWED",
         }[cp.status]

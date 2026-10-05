@@ -123,7 +123,7 @@ class TaskExecution:
         *,
         error: str = "",
     ) -> Attempt:
-        if self.status != Task.RUNNING:
+        if self.status != TaskStatus.RUNNING:
             raise InvalidTransition(
                 "only running execution can be paused"
             )

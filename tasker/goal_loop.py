@@ -575,7 +575,7 @@ class GoalLoop:
                 checkpoint_store,
                 session_id=session.session_id,
                 plan_signature=session.plan_signature,
-            ),
+            )
 
         ex = GraphExecutor(
             self.cfg, graph, self.broker, workdir=workdir, emit=self._emit,

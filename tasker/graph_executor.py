@@ -475,7 +475,7 @@ class GraphExecutor:
                                 attempt_node,
                                 context,
                             )
-                        ),
+                        )
                 except AttemptOutcomeUnknown as exc:
                     execution.pause_attempt(
                         error=str(exc),
