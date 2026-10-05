@@ -22,6 +22,11 @@ from .workflow import stage_for_task
 from .domain.execution import TaskExecution
 from .domain.state_machine import TaskStatus
 
+from .checkpoint_runtime import (
+    AttemptOutcomeUnknown,
+    CheckpointCoordinator,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +75,8 @@ class GraphExecutor:
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
         session_id: str = "",
+        checkpoint_coordinator:
+            CheckpointCoordinator | None = None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -78,10 +85,13 @@ class GraphExecutor:
         self.emit = emit or self._default_emit
         self.goal = goal
         self.state = state if state is not None else {}
+        self._is_resuming = resume_runs is not None
         self.resume_runs = resume_runs or {}
         self.on_task_complete = on_task_complete
         self.tool_catalog = tool_catalog or ToolCatalog.from_config(cfg)
         self.hook_chain = hook_chain or HookChain.from_config(cfg)
+        self.session_id = session_id
+        self.checkpoints = checkpoint_coordinator
         validate_graph(graph)
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.repository_dir = Path(repository_dir).expanduser().resolve() if repository_dir else None
@@ -97,7 +107,6 @@ class GraphExecutor:
         self._quit = threading.Event()
         self._active: dict[str, RunnerBase] = {}
         self._active_lock = threading.Lock()
-        self.session_id = session_id
         self.execution_history: dict[
             str, list[TaskExecution]
         ] = {}
@@ -112,12 +121,28 @@ class GraphExecutor:
     def execute(self) -> list[TaskRun]:
         if not self.graph.nodes:
             return []
+
+        # 在任何Runner启动前，检查整张图
+        if self.checkpoints is not None:
+            self.checkpoints.preflight(
+                (
+                    node.id
+                    for node
+                    in self.graph.nodes
+                ),
+                self.resume_runs,
+                is_resuming=self._is_resuming,
+            )
+        
         try:
             self._execute_dag()
+
         finally:
             self._quit.set()
+
             if self._active:
                 self.stop()
+
         return [self.runs[node.id] for node in self.graph.nodes if node.id in self.runs]
 
     def stop(self) -> None:
@@ -371,7 +396,9 @@ class GraphExecutor:
             session_id = self.session_id,
             task=node,
         )
+
         execution.mark_ready()
+
         with self._runs_lock:
             self.execution_history.setdefault(
                 node.id, []
@@ -414,29 +441,55 @@ class GraphExecutor:
                         )
                     context = f"{context}\n\n{transition_context}" if context else transition_context
 
-                if execution.status == TaskStatus.FAILED:
+
+                if execution.status in {
+                    TaskStatus.FAILED,
+                    TaskStatus.PAUSED,
+                }:
                     execution.mark_ready()
+
                 attempt = execution.start_attempt(
                     executor=executor,
                     attempt_id=attempt_id,
                 )
+
                 with self._runs_lock:
                     self._attempt_context[node.id] = (
                         attempt.id,
                         attempt.parent_attempt_id,
                     )
+
                 try: 
-                    final_run = self._run_code_node(
-                        attempt_node,
-                        context,
-                    )
-                except Exception as exc:
-                    execution.finish_attempt(
-                        success=False,
+                    if self.checkpoints is None:
+                        final_run = self._run_code_node(
+                            attempt_node,
+                            context,
+                        )
+                    else:
+                        final_run = self.checkpoints.run_attempt(
+                            task_id=node.id,
+                            execution_id=execution.execution_id,
+                            attempt_id=attempt.id,
+                            executor=executor,
+                            invoke=lambda: self._run_code_node(
+                                attempt_node,
+                                context,
+                            )
+                        ),
+                except AttemptOutcomeUnknown as exc:
+                    execution.pause_attempt(
                         error=str(exc),
-                        failure_class="orchestrator_error",
                     )
                     raise
+                except Exception as exc:
+                    if  execution.status == TaskStatus.RUNNING:
+                        execution.finish_attempt(
+                            success=False,
+                            error=str(exc),
+                            failure_class="orchestrator_error"
+                        ),
+                    raise
+
                 finally:
                     with self._runs_lock:
                         self._attempt_context.pop(node.id, None)
@@ -452,7 +505,7 @@ class GraphExecutor:
                     error=final_run.error,
                     exit_code=final_run.exit_code,
                     failure_class=failure_class,
-                    cost_used=final_run.cost_usd,
+                    cost_usd=final_run.cost_usd,
                 )
 
 
@@ -465,7 +518,8 @@ class GraphExecutor:
                 retry_cfg = getattr(self.cfg, "retry", None)
                 max_retries = max(0, int(getattr(retry_cfg, "max_retries", 1)))
                 can_retry_same = (
-                    final_run.status == "failed"
+                    self.checkpoints is None
+                    and final_run.status == "failed"
                     and retryable
                     and retry_no < max_retries
                     and not self._quit.is_set()
@@ -475,7 +529,7 @@ class GraphExecutor:
                     transition = "retry"
                 elif final_run.status == "success":
                     transition = "success"
-                elif self._can_failover(final_run, failure_class) and executor_index + 1 < len(executors):
+                elif self.checkpoints is None and self._can_failover(final_run, failure_class) and executor_index + 1 < len(executors):
                     transition = "failover"
                 else:
                     transition = "final"
@@ -580,12 +634,18 @@ class GraphExecutor:
                     self.runs[node.id] = run
 
     def _record_run(self, run: TaskRun) -> None:
+
         if self.on_task_complete is None:
             return
+
         try:
             self.on_task_complete(run)
+
         except Exception:
             logger.exception("任务 %s 完成回调失败", run.task.id)
+            # checkpoint模式下 session 持久化失败 必须中断整个执行链
+            if self.checkpoints is not None:
+                raise
 
     def _blocked_predecessors(self, node_id: str) -> list[str]:
         blocked: list[str] = []
@@ -605,7 +665,9 @@ class GraphExecutor:
         self._emit(run, Event(kind="error", source="orchestrator", text=reason, data={"skipped": True}))
 
     def _run_code_node(self, node: SubTask, extra_context: str = "") -> TaskRun:
+
         workdir = str(self._workdir_for(node))
+
         with self._runs_lock:
             attempt_id, parent_attempt_id = self._attempt_context.pop(node.id, ("", ""))
             run = TaskRun(
@@ -628,6 +690,7 @@ class GraphExecutor:
                 tool_catalog=self.tool_catalog,
                 hook_chain=self.hook_chain,
             )
+
         except ValueError as exc:
             run.status = "failed"
             run.error = str(exc)
@@ -675,7 +738,7 @@ class GraphExecutor:
             run.ended_at = time.time()
             with self._active_lock:
                 self._active.pop(node.id, None)
-            self._record_run(run)
+            # self._record_run(run)
             if run.status == "success":
                 console.status_line("✓", f"{node.id} [{node.executor}] 完成（{run.duration:.1f}s, ${run.cost_usd:.4f}）", "green")
             else:

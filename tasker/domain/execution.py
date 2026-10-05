@@ -14,6 +14,8 @@ from .state_machine import (
     InvalidTransition,
 )
 
+# Task -> TaskExecution -> Attempt 1 Attempt 2 Attempt 3
+
 @dataclass(frozen=True)
 class Attempt:
     id: str
@@ -27,8 +29,9 @@ class Attempt:
     error: str = ""
     exit_code: Optional[int] = None
     failure_class: str = ""
-    cost_used: float = 0.0
+    cost_usd: float = 0.0
 
+# 一次 Task 在当前 Session 中的一次整体执行
 @dataclass
 class TaskExecution:
     session_id: str
@@ -50,8 +53,8 @@ class TaskExecution:
     
     def start_attempt(
         self,
-        executor: Optional[str] = None,
-        attempt_id: Optional[str] = None,
+        executor: str | None = None,
+        attempt_id: str | None = None,
     ) -> Attempt:
         number = len(self.attempts) + 1
         parent_id = self.attempts[-1].id if self.attempts else ""
@@ -78,9 +81,9 @@ class TaskExecution:
         success: bool,
         output: str = "",
         error: str = "",
-        exit_code: Optional[int] = None,
+        exit_code: int | None = None,
         failure_class: str = "",
-        cost_used: float = 0.0,
+        cost_usd: float = 0.0,
     ) -> Attempt:
 
         if self.status != TaskStatus.RUNNING:
@@ -104,7 +107,7 @@ class TaskExecution:
             error=error,
             exit_code=exit_code,
             failure_class=failure_class,
-            cost_used=cost_used,
+            cost_usd=cost_usd,
         )
 
         self.machine.transition(
@@ -115,8 +118,32 @@ class TaskExecution:
         self.attempts[-1] = finished
         return finished
 
+    def pause_attempt(
+        self,
+        *,
+        error: str = "",
+    ) -> Attempt:
+        if self.status != Task.RUNNING:
+            raise InvalidTransition(
+                "only running execution can be paused"
+            )
+        if not self.attempts:
+            raise ValueError(
+                "no active attempt"
+            )
+        current = self.attempts[-1]
+        paused = replace(
+            current,
+            status="unknown",
+            ended_at=time.time(),
+            error=error,
+        )
+        self.attempts[-1] = paused
+        self.machine.transition(TaskStatus.PAUSED)
+        return paused
+
     def cancel(self) -> None:
-        self.machine.transition(TaskStatus.CANCALLED)
+        self.machine.transition(TaskStatus.CANCELLED)
 
     # 持久化和中断恢复的数据基础 session_id 管理上下文 task_id 管理业务目标 execution_id 管理具体执行过程
     def snapshot(self) -> dict:

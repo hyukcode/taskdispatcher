@@ -10,19 +10,19 @@ class TaskStatus(str, Enum):
     PAUSED = "paused"
     SUCCESS = "success"
     FAILED = "failed"
-    CANCALLED = "cancelled"
+    CANCELLED = "cancelled"
     SKIPPED = "skipped"
 
 # 允许流转的状态
-TRANSITIONS = {
+TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.PENDING: {
         TaskStatus.READY,
-        TaskStatus.CANCALLED,
+        TaskStatus.CANCELLED,
         TaskStatus.SKIPPED,
     },
     TaskStatus.READY: {
         TaskStatus.RUNNING,
-        TaskStatus.CANCALLED,
+        TaskStatus.CANCELLED,
         TaskStatus.SKIPPED,
     },
     TaskStatus.RUNNING: {
@@ -30,28 +30,28 @@ TRANSITIONS = {
         TaskStatus.PAUSED,
         TaskStatus.SUCCESS,
         TaskStatus.FAILED,
-        TaskStatus.CANCALLED,
+        TaskStatus.CANCELLED,
     },
     TaskStatus.WAITING_APPROVAL: {
         TaskStatus.RUNNING,
         TaskStatus.PAUSED,
         TaskStatus.FAILED,
-        TaskStatus.CANCALLED,
+        TaskStatus.CANCELLED,
     },
     TaskStatus.PAUSED: {
         TaskStatus.READY,
-        TaskStatus.CANCALLED,
+        TaskStatus.CANCELLED,
     },
     TaskStatus.FAILED: {
         TaskStatus.READY,
-        TaskStatus.CANCALLED,
+        TaskStatus.CANCELLED,
     },
     TaskStatus.SUCCESS: set(),
-    TaskStatus.CANCALLED: set(),
+    TaskStatus.CANCELLED: set(),
     TaskStatus.SKIPPED: set(),
 }
 
-class InvalidTransition(Exception):
+class InvalidTransition(RuntimeError):
     pass
 
 

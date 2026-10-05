@@ -14,6 +14,13 @@ from .models import is_valid_id
 class CheckpointConflict(RuntimeError):
     pass
 
+CHECKPOINT_VERSION = 1
+
+CHECKPOINT_STATUSES = frozenset({
+    "started",
+    "success",
+    "failed",
+})
 
 @dataclass(frozen=True)
 class AttemptCheckpoint:
@@ -30,12 +37,17 @@ class AttemptCheckpoint:
     exit_code: int | None = None
     error: str = ""
 
+  
 
 class CheckpointStore:
     """单进程内线程安全的检查点存储；不支持多个进程同时写同一会话。"""
 
     def __init__(self, base_dir: str | Path):
         self.base = Path(base_dir)
+        self.base.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
         self._lock = threading.RLock()
 
     def _path(self, session_id: str, task_id: str, attempt_id: str) -> Path:

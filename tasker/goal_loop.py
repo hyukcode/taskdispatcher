@@ -15,6 +15,12 @@ from .planner import _extract_json, _validate, plan_with_llm, plan_with_single_c
 from .session import SessionStore, graph_signature
 from .template_compiler import compile_template, load_named_template, validate_template_contract
 from .workflow import apply_workflow_barriers
+from .checkpoint import CheckpointStore
+from .checkpoint_runtime import (
+    AttemptOutcomeUnknown,
+    CheckpointCoordinator,
+    RecoveryBlocked,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -223,7 +229,55 @@ class GoalLoop:
                 )
                 session.status = "running"
                 summary = self._execute(graph, session, resume_runs=resume_runs, persist_runs=True)
-            except Exception as e:  # noqa: BLE001
+            
+            except RecoveryBlocked as exc:
+                session.status = "paused"
+                session.state[
+                    "recovery_required"
+                ] = [
+                    {
+                        "task_id": issue.task_id,
+                        "reason": issue.reason,
+                        "attempt_ids": list(
+                            issue.attempt_ids
+                        ),
+                    }
+                    for issue in exc.issues
+                ]
+
+                self.store.save(
+                    session,
+                    graph,
+                )
+
+                console.warn(str(exc))
+
+                return session
+
+            except AttemptOutcomeUnknown as exc:
+
+                session.status = "paused"
+
+                session.state["recovery_required"] = [
+                    {
+                        "task_id": exc.task_id,
+                        "reason": "RECOVERY_REQUIRED",
+                        "attempt_ids": [
+                            exc.attempt_id
+                        ]
+                    }
+                ]
+
+                self.store.save(
+                    session,
+                    graph,
+                )
+
+                console.warn(str(exc))
+
+                return session
+
+            except Exception as e:
                 logger.exception("任务图执行失败")
                 session.status = "failed"
                 session.state["error"] = str(e)
@@ -450,8 +504,9 @@ class GoalLoop:
         return result
 
     def _load_resume_graph(self, session: Session) -> CompiledGraph | None:
+        
         """对异常退出或中断且计划签名匹配的会话恢复未完成任务。"""
-        if session.status not in {"running", "stopped", "failed"} or not session.plan_signature:
+        if session.status not in {"running", "stopped", "failed", "paused"} or not session.plan_signature:
             return None
         graph = self.store.load_plan(session.session_id)
         if graph is None or graph_signature(graph) != session.plan_signature:
@@ -499,15 +554,28 @@ class GoalLoop:
         resume_runs: dict[str, dict] | None = None,
         persist_runs: bool = True,
     ) -> list[TaskRun]:
+
         """统一执行入口：普通任务图与 evaluator 共用同一 session 工作区。"""
         workdir = str(self.store.workspace(session.session_id))
 
         def on_task_complete(run: TaskRun) -> None:
+
             if not persist_runs:
                 return
+
             with self._persist_lock:
                 session.task_runs[run.task.id] = task_run_to_dict(run)
                 self.store.save(session, graph)
+        
+        checkpoint_coordinator = None
+        # reviewer / evaluator 暂时不进入正式恢复机制
+        if persist_runs:
+            checkpoint_store = CheckpointStore(self.store.base)
+            checkpoint_coordinator = CheckpointCoordinator(
+                checkpoint_store,
+                session_id=session.session_id,
+                plan_signature=session.plan_signature,
+            ),
 
         ex = GraphExecutor(
             self.cfg, graph, self.broker, workdir=workdir, emit=self._emit,
@@ -516,6 +584,7 @@ class GoalLoop:
             resume_runs=resume_runs,
             on_task_complete=on_task_complete,
             session_id=session.session_id,
+            checkpoint_coordinator=checkpoint_coordinator,
         )
         self.current = ex
         try:
