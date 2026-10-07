@@ -13,6 +13,9 @@ from .goal_loop import GoalLoop
 from .live import HELP, LiveTui
 from .models import Session
 from .session import SessionStore, new_session_id
+from .checkpoint import CheckpointStore
+from .checkpoint_runtime import CheckpointCoordinator, RecoveryBlocked
+from .execution_lease import LeaseHeldError
 
 _CODE_SUFFIXES = frozenset({
     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".c", ".h", ".cc", ".cpp",
@@ -269,6 +272,7 @@ class Repl:
                     pending.append(child)
         return result
 
+    # snapshot -> remove checkpoint -> superseded
     def _restart(self, raw_task_id: str) -> None:
         if self.session is None:
             console.warn("当前没有活动会话，先输入目标或 /resume")
@@ -289,21 +293,35 @@ class Repl:
             return
 
         invalidated = self._descendants(graph, task_id)
-        for node_id in invalidated:
-            self.session.task_runs.pop(node_id, None)
-        self.session.status = "stopped"
-        self.session.state["manual_restart"] = {
-            "task_id": task_id,
-            "invalidated_tasks": [node.id for node in graph.nodes if node.id in invalidated],
-        }
-        self.session.history.append(
-            {
-                "type": "manual_restart",
-                "task_id": task_id,
-                "invalidated_tasks": [node.id for node in graph.nodes if node.id in invalidated],
-            }
-        )
-        self.store.save(self.session, graph)
+
+        try:
+            with self.store.execution_lease(self.session.session_id):
+                coordinator = self._checkpoint_coordinator(self.session)
+                coordinator.supersede_tasks(invalidated, reason=f"manual restart from {task_id}")
+
+                for node_id in invalidated:
+                    self.session.task_runs.pop(node_id, None)
+
+                self.session.status = "stopped"
+                
+                self.session.state["manual_restart"] = {
+                    "task_id": task_id,
+                    "invalidated_tasks": sorted(invalidated),
+                }
+                self.session.history.append(
+                    {
+                        "type": "manual_restart",
+                        "task_id": task_id,
+                        "invalidated_tasks": sorted(invalidated),
+                    }
+                )
+                self.store.save(self.session, graph)
+        except RecoveryBlocked as exc:
+            console.warn(str(exc))
+        except LeaseHeldError as exc:
+            console.warn(f"session 正在执行：{exc}")
+            return
+
         rerun_ids = [node.id for node in graph.nodes if node.id in invalidated]
         console.info(
             f"从 {task_id} 重新执行：{', '.join(rerun_ids)}；其上游成功任务将复用原结果"
@@ -340,12 +358,37 @@ class Repl:
         console.info(f"会话 {session_id} 已恢复，可执行 /resume {session_id}")
 
     def _replan(self) -> None:
+
         if self.session is None:
             console.warn("当前没有活动会话")
             return
-        self.session.state.clear()
-        self.session.iteration = 0
-        console.info("已清空状态，重新拆分")
+
+        graph = self.store.load_plan(self.session.session_id)
+
+        try:
+            with self.store.execution_lease(self.session.session_id):
+                if graph is not None and self.session.plan_signature:
+                    coordinator = self._checkpoint_coordinator(self.session)
+                    coordinator.supersede_tasks(
+                        node.id for node in graph.nodes,
+                        reason="manual replan",
+                    )
+                self.session.state.clear()
+                self.session.task_runs.clear()
+                self.session.plan_signature=""
+                self.session.iteration=0
+                self.session.status = "stopped"
+                self.session.history.append({
+                    "type": "manual_replan"
+                })
+                self.store.save(self.session)
+        except RecoveryBlocked as exc:
+            console.warn(str(exc))
+            return
+        except LeaseHeldError as exc:
+            console.warn(f"session 正在执行：{exc}")
+            return
+        console.info("旧计划已失效，重新规划")
         self._run_goal(self.session.goal, self.session)
 
     def _show_plan(self, goal: str) -> None:
@@ -594,18 +637,267 @@ class Repl:
             if summary:
                 print(summary[:2000])
         elif session.status == "paused":
-            console.warn(f"已达 {session.iteration} 轮仍未达成，回到 REPL")
-            console.dim(
-                "/continue 继续未完成任务 | /restart <task_id> 从子任务重启 | /resume "
-                + session.session_id
-                + " 恢复 | /new <目标> 新会话"
-            )
+            recovery=session.state.get("recovery_required")
+            if recovery:
+                console.warn("执行因安全检查暂停")
+                for item in recovery:
+                    print(
+                        "  "
+                        f"{item.get('task_id')}: "
+                        f"{item.get('reason')}"
+                    )
+                    for attempt_id in (
+                        item.get(
+                            "attempt_ids",
+                            [],
+                        )
+                    ):
+                        print(f"    {attempt_id}")
+                console.dim(
+                    "使用 /recover list 查看详情；"
+                    "/recover retry "
+                    "<task_id> <attempt_id> "
+                    "确认后重新执行"
+                )
+            else:
+                console.warn(f"已达 {session.iteration} 轮仍未达成，回到 REPL")
+                console.dim(
+                    "/continue 继续未完成任务 | /restart <task_id> 从子任务重启 | /resume "
+                    + session.session_id
+                    + " 恢复 | /new <目标> 新会话"
+                )
         else:
             console.dim(f"会话状态: {session.status}")
         print(
             f"会话 id: {session.session_id}（/continue 继续；/restart <task_id> 重启子任务；"
             f"/new <目标> 新建会话）"
         )
+
+    def _checkpoint_coordinator(
+        self,
+        session: Session,
+    ) -> CheckpointCoordinator:
+
+        if not session.plan_signature:
+            raise ValueError(
+                "当前 session 没有活动计划"
+            )
+
+        return CheckpointCoordinator(
+            CheckpointStore(
+                self.store.base
+            ),
+            session_id=session.session_id,
+            plan_signature=(
+                session.plan_signature
+            ),
+        )
+
+    def _show_recovery(self) -> None:
+
+        if self.session is None:
+            console.warn("当前没有活动会话")
+            return
+
+        graph = self.store.load_plan(self.session.session_id)
+
+        if graph is None:
+            console.warn("当前会话没有任务图")
+            return
+
+        coordinator = self._checkpoint_coordinator(self.session)
+
+        issues = (
+            coordinator.recovery_issues(
+                (
+                    node.id
+                    for node in graph.nodes
+                ),
+                self.session.task_runs,
+                is_resuming=True,
+            )
+        )
+
+        if not issues:
+            console.info("当前没有需要人工处理的恢复项")
+            return
+
+        console.banner("Recovery Required")
+
+        for issue in issues:
+            print(
+                f"  {issue.task_id}"
+                f"  {issue.reason}"
+            )
+
+            for attempt_id in (
+                issue.attempt_ids
+            ):
+                print(f"      {attempt_id}")
+
+    def _recover(self,raw: str) -> None:
+
+        if self.session is None:
+            console.warn("当前没有活动会话，请先 /resume")
+            return
+
+        parts = raw.split(None,3)
+
+        if (
+            not parts
+            or parts[0].lower()
+            == "list"
+        ):
+            self._show_recovery()
+            return
+
+        action = parts[0].lower()
+
+        if action != "retry":
+            console.warn(
+                "用法: "
+                "/recover list | "
+                "/recover retry "
+                "<task_id> "
+                "<attempt_id> "
+                "[reason]"
+            )
+            return
+
+        if len(parts) < 3:
+            console.warn(
+                "用法: "
+                "/recover retry "
+                "<task_id> "
+                "<attempt_id> "
+                "[reason]"
+            )
+            return
+
+        raw_task_id = parts[1]
+
+        attempt_id = parts[2]
+
+        reason = (
+            parts[3]
+            if len(parts) >= 4
+            else (
+                "operator confirmed "
+                "safe to retry"
+            )
+        )
+
+        graph = self.store.load_plan(
+            self.session.session_id
+        )
+
+        if graph is None:
+            console.warn("当前会话没有任务图")
+            return
+
+        task_id = self._resolve_task_id(
+            graph,
+            raw_task_id,
+        )
+
+        if task_id is None:
+            console.warn(
+                f"任务不存在: "
+                f"{raw_task_id}"
+            )
+            return
+
+        invalidated = self._descendants(
+            graph,
+            task_id,
+        )
+
+        try:
+            with self.store.execution_lease(
+                self.session.session_id
+            ):
+
+                coordinator = (
+                    self._checkpoint_coordinator(
+                        self.session
+                    )
+                )
+
+                coordinator.prepare_retry(
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    invalidated_task_ids=(
+                        invalidated
+                    ),
+                    reason=reason,
+                )
+
+                for node_id in invalidated:
+                    self.session.task_runs.pop(
+                        node_id,
+                        None,
+                    )
+
+                self.session.state.pop(
+                    "recovery_required",
+                    None,
+                )
+
+                self.session.status = (
+                    "paused"
+                )
+
+                self.session.history.append(
+                    {
+                        "type":"recovery_retry",
+                        "task_id":task_id,
+                        "attempt_id":attempt_id,
+                        "reason":reason,
+                        "invalidated_tasks":sorted(invalidated),
+                    }
+                )
+
+                self.store.save(
+                    self.session,
+                    graph,
+                )
+
+        except RecoveryBlocked as exc:
+
+            self.session.state[
+                "recovery_required"
+            ] = [
+                {
+                    "task_id":issue.task_id,
+                    "reason":issue.reason,
+                    "attempt_ids":list(issue.attempt_ids),
+                }
+                for issue
+                in exc.issues
+            ]
+
+            self.store.save(
+                self.session,
+                graph,
+            )
+            console.warn(str(exc))
+            return
+
+        except LeaseHeldError as exc:
+            console.warn(f"当前 session 正在执行，不能修改恢复状态：{exc}")
+            return
+
+        console.info(f"{task_id}/{attempt_id}已允许重新执行"
+        )
+
+        console.info(
+            "已失效任务："
+            + ", ".join(
+                sorted(invalidated)
+            )
+        )
+
+        console.dim("执行 /continue 开始恢复")
 
 
 def main_loop(cfg: Config, *, template=None) -> int:

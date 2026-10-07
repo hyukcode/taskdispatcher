@@ -149,6 +149,8 @@ class SessionConfig:
 
     dir: str = "~/.tasker/sessions"
     workspace_dir: str = "~/.tasker/workspace"
+    lease_ttl_seconds: float = 30.0
+    lease_heartbeat_seconds: float = 5.0
 
     @property
     def path(self) -> Path:
@@ -293,6 +295,34 @@ class Config:
             or self.dispatch.max_failover_attempts < 0
         ):
             raise ValueError("dispatch.max_failover_attempts 必须是大于等于 0 的整数")
+        if (
+            self.session.lease_ttl_seconds
+            <= 0
+        ):
+            raise ValueError(
+                "session.lease_ttl_seconds "
+                "必须大于 0"
+            )
+
+        if (
+            self.session.lease_heartbeat_seconds
+            <= 0
+        ):
+            raise ValueError(
+                "session.lease_heartbeat_seconds "
+                "必须大于 0"
+            )
+
+        if (
+            self.session
+            .lease_heartbeat_seconds
+            >= self.session
+            .lease_ttl_seconds
+        ):
+            raise ValueError(
+                "lease heartbeat "
+                "必须小于 lease ttl"
+            )
         return self
 
 
@@ -422,6 +452,18 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
     if d is not None:
         cfg.session.dir = d.get("dir", cfg.session.dir)
         cfg.session.workspace_dir = d.get("workspace_dir", cfg.session.workspace_dir)
+        cfg.session.lease_ttl_seconds = float(
+            d.get(
+                "lease_ttl_seconds",
+                cfg.session.lease_ttl_seconds,
+            )
+        )
+        cfg.session.lease_heartbeat_seconds = float(
+            d.get(
+                "lease_heartbeat_seconds",
+                cfg.session.lease_heartbeat_seconds,
+            )
+        )
 
     cfg.max_parallel = int(data.get("max_parallel", cfg.max_parallel))
     cfg.timeout_per_task = float(data.get("timeout_per_task", cfg.timeout_per_task))

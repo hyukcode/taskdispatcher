@@ -83,16 +83,16 @@ class CheckpointCoordinator:
         self.session_id = session_id
         self.plan_signature = plan_signature
 
-    def preflight(
+    def recovery_issues(
         self,
         task_ids: Iterable[str],
         resume_runs: Mapping[
-            str, 
-            Mapping[str, Any]
+            str,
+            Mapping[str, Any],
         ] | None = None,
         *,
         is_resuming: bool = False,
-    ) -> None:
+    ) -> list[RecoveryIssue]:
         snapshots = resume_runs or {}
         issues: list[RecoveryIssue] = []
         for task_id in task_ids:
@@ -102,71 +102,65 @@ class CheckpointCoordinator:
             )
             saved_raw = snapshots.get(task_id)
             saved = saved_raw if isinstance(saved_raw, Mapping) else None
-
             current = [
-                checkpoint
-                for checkpoint
-                in checkpoints
-                if checkpoint.plan_signature == self.plan_signature
+                checkpoint for checkpoint in checkpoints if checkpoint.plan_signature == self.plan_signature
             ]
-
             foreign = [
-                checkpoint
-                for checkpoint
-                in checkpoints
-                if checkpoint.plan_signature != self.plan_signature
+                checkpoint for checkpoint in checkpoints if checkpoint.plan_signature != self.plan_signature
             ]
-
-            attempt_ids = tuple(
-                checkpoint.attempt_id
-                for checkpoint
-                in checkpoints
-            )
-
-            # 任何未确认完成的历史执行必须由人工核实
-            if any(
-                checkpoint.status
-                == "started"
-                for checkpoint
-                in checkpoints
-            ):
+            started = [
+                checkpoint for checkpoint in checkpoints if checkpoint.status == "started"
+            ]
+            # 任何未确认完成的历史执行必须由人工核实 
+            if started:
                 issues.append(
                     RecoveryIssue(
                         task_id=task_id,
                         reason="RECOVERY_REQUIRED",
-                        attempt_ids=attempt_ids,
+                        attempt_ids=tuple(
+                            checkpoint.attempt_id
+                            for checkpoint
+                            in started
+                        ),
                     )
                 )
                 continue
-
+            foreign_failures = [
+                checkpoint for checkpoint in foreign if checkpoint.status == "failed"
+            ]
             # 旧计划失败已经产生副作用
-            if any(checkpoint.status == "failed"
-                for checkpoint in foreign
-            ):
+            if foreign_failures:
                 issues.append(
                     RecoveryIssue(
                         task_id=task_id,
-                        reason="OLD_PLAN_REVIEW_REQUIRED",
-                        attempt_ids=attempt_ids,
+                        reason=(
+                            "OLD_PLAN_"
+                            "REVIEW_REQUIRED"
+                        ),
+                        attempt_ids=tuple(
+                            checkpoint.attempt_id
+                            for checkpoint
+                            in foreign_failures
+                        ),
                     )
                 )
                 continue
-            
             current_successes = [
-                checkpoint for checkpoint in current
+                checkpoint
+                for checkpoint in current
                 if checkpoint.status == "success"
             ]
-
             current_failures = [
-                checkpoint for checkpoint in current
+                checkpoint
+                for checkpoint in current
                 if checkpoint.status == "failed"
             ]
-            
             # Session 有记录
             if saved is not None:
                 saved_status = str(
                     saved.get(
-                        "status", ""
+                        "status",
+                        "",
                     )
                 )
                 if saved_status == "success":
@@ -174,17 +168,22 @@ class CheckpointCoordinator:
                         continue
                     if not current_successes:
                         issues.append(
-                            RecoveryIssue(
+                           RecoveryIssue(
                                 task_id=task_id,
-                                reason=(
-                                    "SNAPSHOT_"
-                                    "MISMATCH"
+                                reason="SNAPSHOT_MISMATCH",
+                                attempt_ids=tuple(
+                                    checkpoint.attempt_id
+                                    for checkpoint
+                                    in current
+                                    if checkpoint.status
+                                    not in {
+                                        "abandoned",
+                                        "superseded",
+                                    }
                                 ),
-                                attempt_ids=attempt_ids,
-                            )
+                            ) 
                         )
                         continue
-                    
                     saved_attempt_id = str(
                         saved.get(
                             "attempt_id",
@@ -192,33 +191,32 @@ class CheckpointCoordinator:
                         )
                         or ""
                     )
-
                     if saved_attempt_id:
                         checkpoint_ids = {
                             checkpoint.attempt_id
                             for checkpoint
                             in current_successes
                         }
-                        if (
-                            saved_attempt_id
-                            not in checkpoint_ids
-                        ):
+                        if saved_attempt_id not in checkpoint_ids:
                             issues.append(
                                 RecoveryIssue(
                                     task_id=task_id,
-                                    reason=(
-                                        "SNAPSHOT_"
-                                        "MISMATCH"
+                                    reason="SNAPSHOT_MISMATCH",
+                                    attempt_ids=tuple(
+                                        checkpoint.attempt_id
+                                        for checkpoint
+                                        in current_successes
                                     ),
-                                    attempt_ids=attempt_ids,
                                 )
                             )
                     continue
-                
                 if saved_status in {"pending", "skipped"} and not current:
                     continue
-                
-                if saved_status == "failed" and not current and is_resuming:
+                if (
+                    saved_status == "failed"
+                    and not current
+                    and is_resuming
+                ):
                     issues.append(
                         RecoveryIssue(
                             task_id=task_id,
@@ -233,16 +231,19 @@ class CheckpointCoordinator:
             if current_successes:
                 issues.append(
                     RecoveryIssue(
-                        task_id=task_id,
-                        reason=(
-                            "SUCCESS_WITHOUT_"
-                            "SNAPSHOT"
-                        ),
-                        attempt_ids=attempt_ids,
-                    )
+                    task_id=task_id,
+                    reason=(
+                        "SUCCESS_WITHOUT_"
+                        "SNAPSHOT"
+                    ),
+                    attempt_ids=tuple(
+                        checkpoint.attempt_id
+                        for checkpoint
+                        in current_successes
+                    ),
                 )
-                continue
-            
+            )
+            continue
             if current_failures:
                 issues.append(
                     RecoveryIssue(
@@ -250,11 +251,31 @@ class CheckpointCoordinator:
                         reason=(
                             "REVIEW_BEFORE_RETRY"
                         ),
-                        attempt_ids=attempt_ids,
+                        attempt_ids=tuple(
+                            checkpoint.attempt_id
+                            for checkpoint
+                            in current_failures
+                        ),
                     )
                 )
 
-                continue
+        return issues
+
+    def preflight(
+        self,
+        task_ids: Iterable[str],
+        resume_runs: Mapping[
+            str, 
+            Mapping[str, Any]
+        ] | None = None,
+        *,
+        is_resuming: bool = False,
+    ) -> None:
+        issues = self.recovery_issues(
+            task_ids,
+            resume_runs,
+            is_resuming=is_resuming,
+        )
 
         if issues:
             raise RecoveryBlocked(issues)
@@ -329,3 +350,220 @@ class CheckpointCoordinator:
         )
         return result
 
+    def allow_retry(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        reason: str = "",
+    ) -> AttemptCheckpoint:
+        checkpoint = self.store.load(
+            self.session_id,
+            task_id,
+            attempt_id,
+        )
+        if checkpoint is None:
+            raise FileNotFoundError(attempt_id)
+        if checkpoint.plan_signature != self.plan_signature:
+            raise RecoveryBlocked(
+                [
+                    RecoveryIssue(
+                        task_id=task_id,
+                        reason="PLAN_CHANGED",
+                        attempt_ids=(
+                            attempt_id,
+                        ),
+                    )
+                ]
+            )
+
+        if checkpoint.status in {
+            "abandoned",
+            "superseded",
+        }:
+            return checkpoint
+        
+        if checkpoint.status in {
+            "started",
+            "failed",
+        }:
+            return self.store.abandon_for_retry(
+                self.session_id,
+                task_id,
+                attempt_id,
+                reason=reason,
+            )
+
+        if checkpoint.status == "success":
+            return self.store.supersede(
+                self.session_id,
+                task_id,
+                attempt_id,
+                reason=reason or "operator chose to rerun successful checkpoint"
+            )
+
+        raise RuntimeError(
+            "unsupported checkpoint status: "
+            f"{checkpoint.status}"
+        )
+
+    def supersede_tasks(
+        self,
+        task_ids: Iterable[str],
+        *,
+        reason: str,
+    ) -> list[AttemptCheckpoint]:
+        task_ids = tuple(
+            dict.fromkeys(task_ids)
+        )
+        blockers: list[RecoveryIssue] = []
+        targets: list[AttemptCheckpoint] = []
+        for task_id in task_ids:
+            checkpoints = [
+                checkpoint
+                for checkpoint in self.store.list_for_task(
+                    self.session_id,
+                    task_id,
+                )
+                if checkpoint.plan_signature == self.plan_signature
+            ]
+            started = [
+                checkpoint
+                for checkpoint in checkpoints
+                if checkpoint.status == "started"
+            ]
+            if started:
+                blockers.append(
+                    RecoveryIssue(
+                        task_id=task_id,
+                        reason="RECOVERY_REQUIRED",
+                        attempt_ids=tuple(
+                            checkpoint.attempt_id
+                            for checkpoint
+                            in started
+                        ),
+                    )
+                )
+                continue
+            targets.extend(
+                checkpoint
+                for checkpoint in checkpoints
+                if checkpoint.status
+                not in {
+                    "started",
+                    "superseded",
+                }
+            )
+        if blockers:
+            raise RecoveryBlocked(blockers)
+        
+        updated: list[AttemptCheckpoint] = []
+
+        for checkpoint in targets:
+            updated.append(
+                self.store.supersede(
+                    self.session_id,
+                    checkpoint.task_id,
+                    checkpoint.attempt_id,
+                    reason=reason,
+                )
+            )
+        return updated
+
+    def prepare_retry(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        invalidated_task_ids: Iterable[str],
+        reason: str = "",
+    ) -> AttemptCheckpoint:
+        invalidated = tuple(
+            dict.fromkeys(invalidated_task_ids)
+        )
+        target = self.store.load(
+            self.session_id,
+            task_id,
+            attempt_id,
+        )
+        if target is None:
+            raise FileNotFoundError(attempt_id)
+        if target.plan_signature != self.plan_signature:
+            raise RecoveryBlocked(
+                [
+                    RecoveryIssue(
+                        task_id=task_id,
+                        reason="PLAN_CHANGED",
+                        attempt_ids=(
+                            attempt_id,
+                        ),
+                    )
+                ]
+            )
+        blockers: list[RecoveryIssue] = []
+        for current_task_id in invalidated:
+            checkpoints = [
+                checkpoint
+                for checkpoint
+                in self.store.list_for_task(
+                    self.session_id,
+                    current_task_id,
+                )
+                if checkpoint.plan_signature == self.plan_signature
+            ]
+
+            unknown = [
+                checkpoint for checkpoint in checkpoints
+                if checkpoint.status == "started" and checkpoint.attempt_id != attempt_id
+            ]
+
+            if unknown:
+                blockers.append(
+                    RecoveryIssue(
+                        task_id=current_task_id,
+                        reason="RECOVERY_REQUIRED",
+                        attempt_ids=tuple(
+                            checkpoint.attempt_id
+                            for checkpoint
+                            in unknown
+                        ),
+                    )
+                )
+        if blockers:
+            raise RecoveryBlocked(blockers)
+        
+        resolved = self.allow_retry(
+            task_id=task_id,
+            attempt_id=attempt_id,
+            reason=reason,
+        )
+
+        for current_task_id in invalidated:
+            checkpoints = [
+                checkpoint
+                for checkpoint
+                in self.store.list_for_task(
+                    self.session_id,
+                    current_task_id,
+                )
+                if checkpoint.plan_signature == self.plan_signature
+            ]
+            for checkpoint in checkpoints:
+                if checkpoint.attempt_id == attempt_id:
+                    continue
+                if checkpoint.status in {
+                    "started",
+                    "superseded",
+                }:
+                    continue
+                self.store.supersede(
+                    self.session_id,
+                    current_task_id,
+                    checkpoint.attempt_id,
+                    reason=(
+                        "invalidated by recovery retry "
+                        f"of {task_id}"
+                    ),
+                )
+        return resolved
+        

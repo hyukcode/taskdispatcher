@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .config import SessionConfig
 from .models import CompiledGraph, Session, graph_from_dict, graph_to_dict, is_valid_id, validate_graph
+from .execution_lease import ExecutionLease
 
 
 logger = logging.getLogger(__name__)
@@ -223,3 +224,26 @@ def _atomic_write(path: Path, text: str) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+
+def execution_lease(
+    self,
+    session_id: str,
+    *,
+    on_lost=None,
+) -> ExecutionLease:
+
+    return ExecutionLease(
+        self.dir_for(
+            session_id
+        ),
+        session_id=session_id,
+        ttl_seconds=(
+            self.cfg
+            .lease_ttl_seconds
+        ),
+        heartbeat_seconds=(
+            self.cfg
+            .lease_heartbeat_seconds
+        ),
+        on_lost=on_lost,
+    )

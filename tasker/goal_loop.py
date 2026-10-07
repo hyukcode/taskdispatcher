@@ -21,6 +21,7 @@ from .checkpoint_runtime import (
     CheckpointCoordinator,
     RecoveryBlocked,
 )
+from .execution_lease import LeaseHeldError
 
 
 logger = logging.getLogger(__name__)
@@ -188,7 +189,27 @@ class GoalLoop:
                 },
             )
 
-    def run_goal(self, goal: str, session: Session) -> Session:
+    def run_goal(
+        self,
+        goal: str,
+        session: Session,
+    ) -> Session:
+        self.session = session
+        try:
+            with self.store.execution_lease(
+                session.session_id,
+                on_lost=self.stop,
+            ):
+                return self._run_goal_locked(
+                    goal,
+                    session,
+                )
+        except LeaseHeldError as exc:
+            console.warn(f"该 session 正在被另一个Tasker 实例执行：{exc}")
+            return session
+
+
+    def run_goal_locked(self, goal: str, session: Session) -> Session:
         self.session = session
         if not session.goal:
             session.goal = goal

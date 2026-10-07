@@ -21,6 +21,7 @@ CHECKPOINT_STATUSES = frozenset({
     "success",
     "failed",
     "abandoned",
+    "superseded",
 })
 
 @dataclass(frozen=True)
@@ -37,8 +38,9 @@ class AttemptCheckpoint:
     ended_at: float | None = None
     exit_code: int | None = None
     error: str = ""
-
-  
+    resolution: str = ""
+    resolved_at: float | None = None
+# resolution 人为恢复原因  
 
 class CheckpointStore:
     """单进程内线程安全的检查点存储；不支持多个进程同时写同一会话。"""
@@ -156,15 +158,16 @@ class CheckpointStore:
             }:
                 raise CheckpointConflict(
                     "只有 started / failed attempt "
-                    "才能确认后重新执行"
+                    "才能标记为 abandoned"
                 )
             updated = replace(
                 current,
                 status="abandoned",
-                ended_at=time.time(),
-                error=reason or (
+                ended_at=current.ended_at or time.time(),
+                resolution=reason or (
                    "operator confirmed safe to retry" 
                 ),
+                resolved_at=time.time(),
             )
 
             self._atomic_write(
@@ -178,38 +181,47 @@ class CheckpointStore:
 
             return updated
 
-    def allow_retry(
+    def supersede(
         self,
-        *,
+        session_id: str,
         task_id: str,
         attempt_id: str,
-        reason: str = "",
+        *,
+        reason: str,
     ) -> AttemptCheckpoint:
-        checkpoint = self.store.load(
-            self.session_id,
-            task_id,
-            attempt_id,
-        )
-        if checkpoint is None:
-            raise FileNotFoundError(attempt_id)
-        if checkpoint.plan_signature != self.plan_signature:
-            raise RecoveryBlocked(
-                [
-                    RecoveryIssue(
-                        task_id=task_id,
-                        reason="PLAN_CHANGED",
-                        attempt_ids=(
-                            attempt_id,
-                        ),
-                    )
-                ]
+
+        with self._lock:
+            current = self.load(
+                session_id,
+                task_id,
+                attempt_id,
             )
-        return self.store.abandon_for_retry(
-            self.session_id,
-            task_id,
-            attempt_id,
-            reason=reason,
-        )
+            if current is None:
+                raise FileNotFoundError(attempt_id)
+            if current.status == "superseded":
+                return current
+            if current.status == "started":
+                raise CheckpointConflict(
+                    "started attempt 的结果未知，"
+                    "不能直接 supersede"
+                )
+            updated = replace(
+                current,
+                status="superseded",
+                ended_at=current.ended_at or time.time(),
+                resolution=reason or "result superseded",
+                resolved_at=time.time(),
+            )
+            self._atomic_write(
+                self._path(
+                    session_id,
+                    task_id,
+                    attempt_id,
+                ),
+                updated,
+            )
+
+            return updated
 
 
     def finish(
@@ -247,8 +259,11 @@ class CheckpointStore:
         return [cp for cp in result if cp is not None]
 
     def inspect_execution(
-        self, session_id: str, task_id: str,
-        execution_id: str, plan_signature: str,
+        self, 
+        session_id: str, 
+        task_id: str,
+        execution_id: str, 
+        plan_signature: str,
     ) -> str:
         """给恢复协调器一个保守判定，而不是自动启动 Runner。"""
         attempts = [cp for cp in self.list_for_task(session_id, task_id)
@@ -261,7 +276,9 @@ class CheckpointStore:
             return "RECOVERY_REQUIRED"
         if any(cp.status == "success" for cp in attempts):
             return "REUSE_RESULT"
-        return "REVIEW_BEFORE_RETRY"
+        if any(cp.status == "failed" for cp in attempts):
+            return "REVIEW_BEFORE_RETRY"
+        return "RETRY_ALLOW"
 
     def recovery_decision(
         self, 
@@ -280,4 +297,5 @@ class CheckpointStore:
             "success": "REUSE_RESULT",
             "failed": "REVIEW_BEFORE_RETRY",
             "abandoned": "RETRY_ALLOWED",
+            "superseded": "RETRY_ALLOWED",
         }[cp.status]
