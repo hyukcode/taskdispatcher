@@ -202,3 +202,6 @@ tasker/
 **运行卡住不结束？**
 执行器发完最终结果后，Tasker 根据 `result` / `turn/completed` 和 `completion_idle` 收尾；可 `:done` 手动收尾。
 # taskdispatcher
+
+
+

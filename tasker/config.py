@@ -160,6 +160,27 @@ class SessionConfig:
     def workspace_path(self) -> Path:
         return Path(self.workspace_dir).expanduser()
 
+@dataclass
+class MemoryConfig:
+    enabled: bool = True
+    session_limit: int = 8
+    long_term_limit: int = 4
+    task_result_max_chars: int = 4000
+    context_max_chars: int = 6000
+    long_term_enabled: bool = False
+    long_term_dir: str = "~/.tasker/memory/long_term"
+
+@property
+def long_term_path(self) -> Path:
+    return Path(self.long_term_dir).expanduser()
+
+
+@dataclass
+class ArtifactConfig:
+    enabled: bool = True
+    threshold_chars: int = 3000
+    preview_chars: int = 800
+
 
 @dataclass
 class Config:
@@ -179,6 +200,8 @@ class Config:
     session: SessionConfig = field(default_factory=SessionConfig)
     max_parallel: int = 2
     timeout_per_task: float = 900.0
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
 
     def validate(self) -> "Config":
         """校验配置并在加载边界尽早报告错误。"""
@@ -322,6 +345,37 @@ class Config:
             raise ValueError(
                 "lease heartbeat "
                 "必须小于 lease ttl"
+            )
+        if self.memory.session_limit < 0:
+            raise ValueError(
+                "memory.session_limit "
+                "不能小于 0"
+            )
+
+        if self.memory.context_max_chars < 500:
+            raise ValueError(
+                "memory.context_max_chars "
+                "不能小于 500"
+            )
+        if self.artifacts.threshold_chars < 500:
+            raise ValueError(
+                "artifacts.threshold_chars "
+                "不能小于 500"
+            )
+
+        if self.artifacts.preview_chars < 100:
+            raise ValueError(
+                "artifacts.preview_chars "
+                "不能小于 100"
+            )
+
+        if (
+            self.artifacts.preview_chars
+            >= self.artifacts.threshold_chars
+        ):
+            raise ValueError(
+                "artifacts.preview_chars "
+                "必须小于 threshold_chars"
             )
         return self
 

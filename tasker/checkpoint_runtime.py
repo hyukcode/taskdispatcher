@@ -243,7 +243,7 @@ class CheckpointCoordinator:
                     ),
                 )
             )
-            continue
+                continue
             if current_failures:
                 issues.append(
                     RecoveryIssue(

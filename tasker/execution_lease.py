@@ -1,4 +1,4 @@
-# 多终端同时重启同一session
+# 多终端同时resume同一session，只允许一个进程真正执行
 
 from __future__ import annotations
 
@@ -154,7 +154,7 @@ class ExecutionLease:
         )
         temp_path = self.lease_dir / (
             f".lease-"
-            f"{self.owner_id}.tmo"
+            f"{self.owner_id}.tmp"
         )
         try:
             with open(
@@ -210,6 +210,7 @@ class ExecutionLease:
         for _ in range(8):
 
             try:
+                # 跨进程互斥
                 self.lease_dir.mkdir()
 
             except FileExistsError:
@@ -278,15 +279,16 @@ class ExecutionLease:
             self._start_heartbeat()
             return record
         raise RuntimeError("unable to acquire execution lease")
+        
 
     def refresh(self) -> LeaseRecord:
         with self._lock:
             if not self._acquired:
-                 raise LeaseLostError("lease is not acquired")
+                 raise LeaseHostError("lease is not acquired")
             current = self._read_record()
             if current is None or current.owner_id != self.owner_id:
                 self._mark_lost()
-                raise LeaseLostError(
+                raise LeaseHostError(
                     "execution lease ownership "
                     "was lost"
                 )

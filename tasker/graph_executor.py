@@ -26,6 +26,7 @@ from .checkpoint_runtime import (
     AttemptOutcomeUnknown,
     CheckpointCoordinator,
 )
+from .memory_runtime import MemoryManager
 
 
 logger = logging.getLogger(__name__)
@@ -75,8 +76,8 @@ class GraphExecutor:
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
         session_id: str = "",
-        checkpoint_coordinator:
-            CheckpointCoordinator | None = None,
+        checkpoint_coordinator: CheckpointCoordinator | None = None,
+        memory_manager: MemoryManager | None = None,
     ):
         self.cfg = cfg
         self.graph = graph
@@ -110,6 +111,7 @@ class GraphExecutor:
         self.execution_history: dict[
             str, list[TaskExecution]
         ] = {}
+        self.memory = memory_manager
 
     @staticmethod
     def _default_emit(run: TaskRun | None, event: Event) -> None:
@@ -809,17 +811,62 @@ class GraphExecutor:
             parts.append(loop_prompt)
         if node.acceptance:
             parts.append(f"完成标准: {node.acceptance}")
-        deps = [d for d in self._predecessors(node.id) if d in self.runs and self.runs[d].output]
-        if deps:
-            dependency_outputs = [self.runs[d].output[:max_dependency] for d in deps]
-            parts.append("\n依赖任务输出（作为上下文）：\n" + "\n---\n".join(dependency_outputs)[:max_dependency])
-        dep_ids = [d for d in deps if self.runs[d].status == "success"]
-        if dep_ids:
-            parts.append(
-                "\n注意：前置任务 (" + ", ".join(dep_ids) + ") 的文件产物已落在当前工作目录中，请直接读取使用。"
+        # deps = [d for d in self._predecessors(node.id) if d in self.runs and self.runs[d].output]
+        # if deps:
+        #     dependency_outputs = [self.runs[d].output[:max_dependency] for d in deps]
+        #     parts.append("\n依赖任务输出（作为上下文）：\n" + "\n---\n".join(dependency_outputs)[:max_dependency])
+        # dep_ids = [d for d in deps if self.runs[d].status == "success"]
+        # if dep_ids:
+        #     parts.append(
+        #         "\n注意：前置任务 (" + ", ".join(dep_ids) + ") 的文件产物已落在当前工作目录中，请直接读取使用。"
+        #     )
+        # if self.state:
+        #     parts.append("\n累计状态：" + json.dumps(self.state, ensure_ascii=False)[:max_state])
+
+        dependency_runs = []
+        for dependency_id in self._predecessors(node.id):
+            run = self.runs.get(dependency_id)
+            if run is not None:
+                dependency_runs.append(run)
+        if self.memory is not None:
+            working_memory = self.memory.build_working_memory(
+                node=node,
+                dependency_runs=dependency_runs,
+                session_state=self.state,
             )
-        if self.state:
-            parts.append("\n累计状态：" + json.dumps(self.state, ensure_ascii=False)[:max_state])
+            if working_memory:
+                parts.append(
+                    "当前任务 Working Memory：\n"
+                    + working_memory
+                )
+        else:
+            # 兼容旧模式。
+            deps = [
+                run
+                for run
+                in dependency_runs
+                if run.output
+            ]
+            if deps:
+                parts.append(
+                    "\n依赖任务输出：\n"
+                    + "\n---\n".join(
+                        run.output[
+                            :max_dependency
+                        ]
+                        for run in deps
+                    )
+                )
+
+            if self.state:
+                parts.append(
+                    "\n累计状态："
+                    + json.dumps(
+                        self.state,
+                        ensure_ascii=False,
+                    )[:max_state]
+                )
+
         if extra_context:
             parts.append(extra_context[:max_context])
         prompt = "\n\n".join(parts)

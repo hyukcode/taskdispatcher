@@ -22,6 +22,8 @@ from .checkpoint_runtime import (
     RecoveryBlocked,
 )
 from .execution_lease import LeaseHeldError
+from .memory_runtime import MemoryManager
+from .memory_store import MemoryStore
 
 
 logger = logging.getLogger(__name__)
@@ -577,7 +579,8 @@ class GoalLoop:
     ) -> list[TaskRun]:
 
         """统一执行入口：普通任务图与 evaluator 共用同一 session 工作区。"""
-        workdir = str(self.store.workspace(session.session_id))
+        workspace = self.store.workspace(session.session_id)
+        workdir = str(workspace)
 
         def on_task_complete(run: TaskRun) -> None:
 
@@ -585,10 +588,33 @@ class GoalLoop:
                 return
 
             with self._persist_lock:
+                # Session / TaskRun 事实源
                 session.task_runs[run.task.id] = task_run_to_dict(run)
-                self.store.save(session, graph)
+                self.store.save(
+                    session,
+                    graph,
+                )
+                if memory_manager is not None:
+                    try:
+                        memory_manager.record_task_run(run)
+                    except Exception:
+                        logger.exception(
+                            "任务 %s Memory "
+                            "写入失败",
+                            run.task.id,`
+                        )
         
         checkpoint_coordinator = None
+        memory_manager = None
+        artifact_store = None
+
+        if persist_runs and self.cfg.artifacts.enabled:
+            artifact_store = ArtifactStore(
+                workspace_root=workspace,
+                session_id=session.session_id,
+        )
+
+
         # reviewer / evaluator 暂时不进入正式恢复机制
         if persist_runs:
             checkpoint_store = CheckpointStore(self.store.base)
@@ -597,15 +623,39 @@ class GoalLoop:
                 session_id=session.session_id,
                 plan_signature=session.plan_signature,
             )
+        if persist_runs and self.cfg.memory.enabled:
+            memory_store = MemoryStore(
+                session_base=self.store.base,
+                long_term_base=self.cfg.memory.long_term_path,
+            )
+            memory_manager = MemoryManager(
+                memory_store,
+                session_id=session.session_id,
+                artifact_store=artifact_store,
+                session_limit=self.cfg.memory.session_limit,
+                long_term_limit=self.cfg.memory.long_term_limit,
+                task_result_max_chars=self.cfg.memory.task_result_max_chars,
+                artifact_threshold_chars=self.cfg.artifacts.threshold_chars,
+                artifact_preview_chars=self.cfg.artifacts.preview_chars,
+                context_max_chars=self.cfg.memory.context_max_chars,
+                long_term_enabled=self.cfg.memory.long_term_enabled,
+            )
+
 
         ex = GraphExecutor(
-            self.cfg, graph, self.broker, workdir=workdir, emit=self._emit,
-            goal=session.goal, state=session.state,
+            self.cfg, 
+            graph, 
+            self.broker, 
+            workdir=workdir, 
+            emit=self._emit,
+            goal=session.goal, 
+            state=session.state,
             repository_dir=self.repository_dir,
             resume_runs=resume_runs,
             on_task_complete=on_task_complete,
             session_id=session.session_id,
             checkpoint_coordinator=checkpoint_coordinator,
+            memory_manager=memory_manager,
         )
         self.current = ex
         try:
