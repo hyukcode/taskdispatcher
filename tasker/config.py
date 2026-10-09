@@ -169,10 +169,13 @@ class MemoryConfig:
     context_max_chars: int = 6000
     long_term_enabled: bool = False
     long_term_dir: str = "~/.tasker/memory/long_term"
+    max_task_results: int = 20
+    max_notes: int = 20
+    artifact_gc_grace_seconds: float = 3600.0
 
-@property
-def long_term_path(self) -> Path:
-    return Path(self.long_term_dir).expanduser()
+    @property
+    def long_term_path(self) -> Path:
+        return Path(self.long_term_dir).expanduser()
 
 
 @dataclass
@@ -348,8 +351,23 @@ class Config:
             )
         if self.memory.session_limit < 0:
             raise ValueError(
-                "memory.session_limit "
+                "memory.session_limit 不能小于 0"
+            )
+
+        if self.memory.long_term_limit < 0:
+            raise ValueError(
+                "memory.long_term_limit "
                 "不能小于 0"
+            )
+
+        if (
+            self.memory
+            .task_result_max_chars
+            < 200
+        ):
+            raise ValueError(
+                "memory.task_result_max_chars "
+                "不能小于 200"
             )
 
         if self.memory.context_max_chars < 500:
@@ -357,6 +375,30 @@ class Config:
                 "memory.context_max_chars "
                 "不能小于 500"
             )
+
+        if self.memory.max_task_results < 0:
+            raise ValueError(
+                "memory.max_task_results "
+                "不能小于 0"
+            )
+
+        if self.memory.max_notes < 0:
+            raise ValueError(
+                "memory.max_notes "
+                "不能小于 0"
+            )
+
+        if (
+            self.memory
+            .artifact_gc_grace_seconds
+            < 0
+        ):
+            raise ValueError(
+                "artifact_gc_grace_seconds "
+                "不能小于 0"
+            )
+
+
         if self.artifacts.threshold_chars < 500:
             raise ValueError(
                 "artifacts.threshold_chars "
@@ -365,8 +407,7 @@ class Config:
 
         if self.artifacts.preview_chars < 100:
             raise ValueError(
-                "artifacts.preview_chars "
-                "不能小于 100"
+                "artifacts.preview_chars 不能小于 100"
             )
 
         if (
@@ -516,6 +557,86 @@ def _merge_cfg(cfg: Config, data: dict[str, Any]) -> Config:
             d.get(
                 "lease_heartbeat_seconds",
                 cfg.session.lease_heartbeat_seconds,
+            )
+        )
+
+    d = section("memory")
+    if d is not None:
+        cfg.memory.enabled = as_bool(
+            d.get("enabled", cfg.memory.enabled),
+            "memory.enabled",
+        )
+        cfg.memory.session_limit = int(
+            d.get("session_limit", cfg.memory.session_limit)
+        )
+        cfg.memory.long_term_limit = int(
+            d.get("long_term_limit", cfg.memory.long_term_limit)
+        )
+        cfg.memory.task_result_max_chars = int(
+            d.get("task_result_max_chars", cfg.memory.task_result_max_chars)
+        )
+        cfg.memory.context_max_chars = int(
+            d.get("context_max_chars", cfg.memory.context_max_chars)
+        )
+        cfg.memory.long_term_enabled = as_bool(
+            d.get(
+                "long_term_enabled",
+                cfg.memory
+                .long_term_enabled,
+            ),
+            "memory.long_term_enabled",
+        )
+        cfg.memory.long_term_dir = str(
+            d.get(
+                "long_term_dir",
+                cfg.memory.long_term_dir,
+            )
+        )
+        cfg.memory.max_task_results = int(
+            d.get(
+                "max_task_results",
+                cfg.memory.max_task_results,
+            )
+        )
+        cfg.memory.max_notes = int(
+            d.get(
+                "max_notes",
+                cfg.memory.max_notes,
+            )
+        )
+        cfg.memory.artifact_gc_grace_seconds = float(
+            d.get(
+                "artifact_gc_grace_seconds",
+                cfg.memory
+                .artifact_gc_grace_seconds,
+            )
+        )
+
+    d = section("artifacts")
+
+    if d is not None:
+
+        cfg.artifacts.enabled = as_bool(
+            d.get(
+                "enabled",
+                cfg.artifacts.enabled,
+            ),
+            "artifacts.enabled",
+        )
+
+        cfg.artifacts.threshold_chars = int(
+            d.get(
+                "threshold_chars",
+                cfg.artifacts
+                .threshold_chars,
+            )
+        )
+
+        cfg.artifacts.preview_chars = int(
+            d.get(
+                "preview_chars",
+                cfg.artifacts
+                .preview_chars,
             )
         )
 

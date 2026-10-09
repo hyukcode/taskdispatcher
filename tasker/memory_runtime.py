@@ -6,46 +6,102 @@ import time
 
 from dataclasses import replace
 
+from .artifact_store import (
+    ArtifactStore,
+)
+
+from .domain.artifact import (
+    ArtifactKind,
+)
+
 from .domain.memory import (
     MemoryKind,
     MemoryRecord,
     MemoryScope,
+    MemoryStatus,
     new_memory_record,
 )
 
-from .memory_store import MemoryStore
+from .memory_store import (
+    MemoryStore,
+)
 
-from .artifact_store import ArtifactStore
-from .domain.artifact import ArtifactKind
+from .models import (
+    SubTask,
+    TaskRun,
+)
 
-from .models import SubTask, TaskRun
 
 class MemoryManager:
+
     def __init__(
         self,
-        store: MemoryScope,
+        store: MemoryStore,
         *,
         session_id: str,
-        artifact_store: ArtifactStore | None = None,
+
+        artifact_store:
+            ArtifactStore | None = None,
+
         session_limit: int = 8,
         long_term_limit: int = 4,
+
         task_result_max_chars: int = 4000,
+
         artifact_threshold_chars: int = 3000,
         artifact_preview_chars: int = 800,
+
         context_max_chars: int = 6000,
+
         long_term_enabled: bool = False,
     ) -> None:
+
         self.store = store
-        self.artifact_store = artifact_store
+
         self.session_id = session_id
-        self.artifact_threshold_chars = max(500, artifact_threshold_chars)
-        self.artifact_preview_chars = max(100, artifact_preview_chars)
-        self.session_limit = max(0, session_limit)
-        self.long_term_limit = max(0, long_term_limit)
-        self.task_result_max_chars = max(200, task_result_max_chars)
-        self.context_max_chars = max(500, context_max_chars)
-        self.long_term_enabled = long_term_enabled
-    
+
+        self.artifact_store = (
+            artifact_store
+        )
+
+        self.session_limit = max(
+            0,
+            session_limit,
+        )
+
+        self.long_term_limit = max(
+            0,
+            long_term_limit,
+        )
+
+        self.task_result_max_chars = max(
+            200,
+            task_result_max_chars,
+        )
+
+        self.artifact_threshold_chars = max(
+            500,
+            artifact_threshold_chars,
+        )
+
+        self.artifact_preview_chars = max(
+            100,
+            artifact_preview_chars,
+        )
+
+        self.context_max_chars = max(
+            500,
+            context_max_chars,
+        )
+
+        self.long_term_enabled = (
+            long_term_enabled
+        )
+
+    # =========================
+    # identity
+    # =========================
+
     @staticmethod
     def _stable_id(
         *,
@@ -54,6 +110,7 @@ class MemoryManager:
         kind: MemoryKind,
         key: str,
     ) -> str:
+
         raw = (
             f"{scope.value}|"
             f"{session_id}|"
@@ -67,7 +124,10 @@ class MemoryManager:
 
         return f"m-{digest}"
 
-   
+    # =========================
+    # write
+    # =========================
+
     def remember_session(
         self,
         *,
@@ -75,26 +135,35 @@ class MemoryManager:
         content: str,
         key: str,
         source_task_id: str = "",
-        tags: tuple[str, ...] = (),
-        artifact_ids: tuple[
-            str, ...
-        ] = (),
+        tags: tuple[str, ...] | None = None,
+        artifact_ids: tuple[str, ...] | None = None,
         priority: int = 50,
-    ) -> MemoryKind:
+    ) -> MemoryRecord:
+
         content = content.strip()
         if not content:
-            raise ValueError("memory content is empty")
+            raise ValueError(
+                "memory content is empty"
+            )
+
+        if not key.strip():
+            raise ValueError(
+                "memory key is empty"
+            )
+
         memory_id = self._stable_id(
             scope=MemoryScope.SESSION,
             session_id=self.session_id,
             kind=kind,
             key=key,
         )
+
         existing = self.store.load(
             scope=MemoryScope.SESSION,
             session_id=self.session_id,
             memory_id=memory_id,
         )
+
         if existing is None:
             record = new_memory_record(
                 memory_id=memory_id,
@@ -102,67 +171,127 @@ class MemoryManager:
                 kind=kind,
                 content=content,
                 session_id=self.session_id,
-                source_task_id=(
-                    source_task_id
-                ),
+                source_task_id=source_task_id,
                 key=key,
-                tags=tags,
-                artifact_ids=artifact_ids,
+                tags=tags if tags is not None else (),
+                artifact_ids=artifact_ids if artifact_ids is not None else (),
                 priority=priority,
             )
+
         else:
+
             record = replace(
                 existing,
+                status=(
+                    MemoryStatus.ACTIVE
+                ),
                 content=content,
                 source_task_id=(
                     source_task_id
                     or existing.source_task_id
                 ),
-                tags=tags or existing.tags,
+                tags=(
+                    existing.tags if tags is None else tags
+                ),
                 artifact_ids=(
-                    artifact_ids
-                    or existing.artifact_ids
+                    existing.artifact_ids if artifact_ids is None else artifact_ids
                 ),
                 priority=max(
                     0,
-                    min(100, priority),
+                    min(
+                        100,
+                        priority,
+                    ),
                 ),
+                superseded_by="",
                 updated_at=time.time(),
             )
-        return self.store.save(record)
-    
+
+        return self.store.save(
+            record
+        )
+
+    def remember_fact(
+        self,
+        *,
+        key: str,
+        content: str,
+        priority: int = 80,
+    ) -> MemoryRecord:
+
+        return self.remember_session(
+            kind=MemoryKind.FACT,
+            key=key,
+            content=content,
+            tags=("fact",),
+            priority=priority,
+        )
+
+    def remember_decision(
+        self,
+        *,
+        key: str,
+        content: str,
+        priority: int = 90,
+    ) -> MemoryRecord:
+
+        return self.remember_session(
+            kind=MemoryKind.DECISION,
+            key=key,
+            content=content,
+            tags=("decision",),
+            priority=priority,
+        )
+
+    # =========================
+    # TaskRun -> Memory
+    # =========================
+
     def record_task_run(
         self,
         run: TaskRun,
     ) -> MemoryRecord | None:
-    # 只记录成功的信息，失败信息有checkpoint taskrun eventlog recoveryhistory
+
         if run.status != "success":
             return None
-        output = (run.output or "").strip()
+
+        output = (
+            run.output
+            or ""
+        ).strip()
+
         if not output:
             return None
-        artifact_ids: tuple[str, ...] = ()
+
+        artifact_ids: tuple[
+            str, ...
+        ] = ()
+
         if (
-            self.artifact_store is None
-            or len(output) <= self.artifact_threshold_chars
+            self.artifact_store is not None
+            and len(output)
+            > self.artifact_threshold_chars
         ):
-            memory_content = (
-                f"任务 {run.task.id} "
-                f"({run.task.title})"
-                f"执行成功。\n"
-                f"{output[:self.task_result_max_chars]}"
-            )
-        else:
+
             artifact = (
-                self.artifact_store.save_text(
+                self.artifact_store
+                .save_text(
                     task_id=run.task.id,
+
                     name=(
-                        f"{run.task.id}-output.txt"
+                        f"{run.task.id}-"
+                        "output.txt"
                     ),
+
                     content=output,
-                    kind=ArtifactKind.TASK_OUTPUT,
+
+                    kind=(
+                        ArtifactKind
+                        .TASK_OUTPUT
+                    ),
                 )
             )
+
             artifact_ids = (
                 artifact.id,
             )
@@ -171,39 +300,59 @@ class MemoryManager:
                 :self.artifact_preview_chars
             ]
 
-            memory_content = (
+            content = (
                 f"任务 {run.task.id} "
                 f"({run.task.title}) "
-                "执行成功。\n\n"
-                "完整输出已保存为 Artifact：\n"
-                f"- id: {artifact.id}\n"
-                f"- path: "
-                f"{artifact.relative_path}\n"
-                f"- size: "
-                f"{artifact.size_bytes} bytes\n"
-                f"- sha256: "
-                f"{artifact.sha256}\n\n"
-                "输出预览：\n"
+                "执行成功。\n"
+                "完整输出已保存为 Artifact。\n"
+                f"artifact_id={artifact.id}\n"
+                f"path={artifact.relative_path}\n"
+                f"size={artifact.size_bytes}\n"
+                "\n输出预览：\n"
                 f"{preview}"
             )
+
+        else:
+
+            preview = output[
+                :self.task_result_max_chars
+            ]
+
+            content = (
+                f"任务 {run.task.id} "
+                f"({run.task.title}) "
+                "执行成功。\n"
+                f"{preview}"
+            )
+
         return self.remember_session(
             kind=MemoryKind.TASK_RESULT,
+
             key=(
                 f"task-result:"
                 f"{run.task.id}"
             ),
-            content=memory_content,
+
+            content=content,
+
             source_task_id=(
                 run.task.id
             ),
+
             tags=(
                 "task-result",
                 run.task.id,
                 run.task.executor,
             ),
+
             artifact_ids=artifact_ids,
+
             priority=70,
         )
+
+    # =========================
+    # promotion
+    # =========================
 
     def promote(
         self,
@@ -212,16 +361,23 @@ class MemoryManager:
         key: str,
         priority: int | None = None,
     ) -> MemoryRecord:
+
         if (
             record.scope
             != MemoryScope.SESSION
         ):
             raise ValueError(
-                "only session memory can be promoted"
+                "only session memory "
+                "can be promoted"
             )
 
+        # Session Artifact 的生命周期
+        # 不能直接跨 Session。
         if record.artifact_ids:
-            raise ValueError("memory with session artifacts cannot be promoted directly")
+            raise ValueError(
+                "memory referencing session "
+                "artifacts cannot be promoted"
+            )
 
         memory_id = self._stable_id(
             scope=MemoryScope.LONG_TERM,
@@ -230,30 +386,84 @@ class MemoryManager:
             key=key,
         )
 
-        promoted = new_memory_record(
+        existing = self.store.load(
+            scope=MemoryScope.LONG_TERM,
             memory_id=memory_id,
-            scope=(
-                MemoryScope.LONG_TERM
-            ),
-            kind=record.kind,
-            content=record.content,
-            source_task_id=record.source_task_id,
-            key=key,
-            tags=record.tags,
-            priority=(
-                record.priority
-                if priority is None
-                else priority
-            ),
         )
 
-        return self.store.save(promoted)
-    
+        now = time.time()
+
+        if existing is None:
+
+            promoted = new_memory_record(
+                memory_id=memory_id,
+
+                scope=(
+                    MemoryScope.LONG_TERM
+                ),
+
+                kind=record.kind,
+
+                content=record.content,
+
+                key=key,
+
+                tags=record.tags,
+
+                priority=(
+                    record.priority
+                    if priority is None
+                    else priority
+                ),
+            )
+
+        else:
+
+            promoted = replace(
+                existing,
+
+                status=(
+                    MemoryStatus.ACTIVE
+                ),
+
+                content=record.content,
+
+                tags=record.tags,
+
+                priority=(
+                    existing.priority
+                    if priority is None
+                    else max(
+                        0,
+                        min(
+                            100,
+                            priority,
+                        ),
+                    )
+                ),
+
+                superseded_by="",
+
+                updated_at=now,
+            )
+
+        return self.store.save(
+            promoted
+        )
+
+    # =========================
+    # retrieval
+    # =========================
+
     @staticmethod
-    def _terms(text: str) -> set[str]:
+    def _terms(
+        text: str,
+    ) -> set[str]:
+
         return {
             token.casefold()
-            for token in re.findall(
+            for token
+            in re.findall(
                 r"[A-Za-z0-9_./-]+|"
                 r"[\u4e00-\u9fff]{2,}",
                 text,
@@ -265,7 +475,11 @@ class MemoryManager:
         self,
         record: MemoryRecord,
         query: str,
-    ) -> tuple[int, int, float]:
+    ) -> tuple[
+        int,
+        int,
+        float,
+    ]:
 
         terms = self._terms(
             query
@@ -274,7 +488,9 @@ class MemoryManager:
         haystack = (
             record.content
             + " "
-            + " ".join(record.tags)
+            + " ".join(
+                record.tags
+            )
             + " "
             + record.key
         ).casefold()
@@ -290,10 +506,12 @@ class MemoryManager:
             record.priority,
             record.updated_at,
         )
-    
+
     def _relevant(
         self,
-        records: list[MemoryRecord],
+        records: list[
+            MemoryRecord
+        ],
         *,
         query: str,
         limit: int,
@@ -302,18 +520,43 @@ class MemoryManager:
         if limit <= 0:
             return []
 
-        ranked = sorted(
-            records,
-            key=lambda record: (
+        scored = [
+            (
                 self._score(
                     record,
                     query,
-                )
-            ),
+                ),
+                record,
+            )
+            for record in records
+            if record.status
+            == MemoryStatus.ACTIVE
+        ]
+
+        # 如果有 query，0 命中的 Memory 不注入。
+        if self._terms(query):
+
+            scored = [
+                item
+                for item in scored
+                if item[0][0] > 0
+            ]
+
+        scored.sort(
+            key=lambda item:
+                item[0],
             reverse=True,
         )
 
-        return ranked[:limit]
+        return [
+            record
+            for _score, record
+            in scored[:limit]
+        ]
+
+    # =========================
+    # Direct dependency
+    # =========================
 
     def _task_result_memory(
         self,
@@ -322,8 +565,11 @@ class MemoryManager:
 
         memory_id = self._stable_id(
             scope=MemoryScope.SESSION,
+
             session_id=self.session_id,
+
             kind=MemoryKind.TASK_RESULT,
+
             key=(
                 f"task-result:"
                 f"{task_id}"
@@ -336,33 +582,54 @@ class MemoryManager:
             memory_id=memory_id,
         )
 
+    # =========================
+    # Working Memory
+    # =========================
+
     def build_working_memory(
         self,
         *,
         node: SubTask,
-        dependency_runs: list[TaskRun],
+
+        dependency_runs:
+            list[TaskRun],
+
         session_state: dict,
     ) -> str:
+
         sections: list[str] = []
+
         dependency_task_ids = {
             run.task.id
-            for run in dependency_runs
+            for run
+            in dependency_runs
         }
+
+        # ---------------------
+        # 1. Direct dependency
+        # ---------------------
+
         for run in dependency_runs:
-            if run.status != "success" or not run.output:
+
+            if run.status != "success":
                 continue
+
             remembered = (
                 self._task_result_memory(
                     run.task.id
                 )
             )
 
-            # 优先使用 Memory 版本，大输出时它已经变成Artifact preview。
-            if remembered is not None:
+            if (
+                remembered is not None
+                and remembered.status
+                == MemoryStatus.ACTIVE
+            ):
                 sections.append(
                     "[直接依赖]\n"
                     + remembered.content
                 )
+
                 continue
 
             # 兼容旧 Session。
@@ -391,77 +658,181 @@ class MemoryManager:
                 f"{preview}"
             )
 
-        feedback = str(session_state.get("feedback", "") or "").strip()
+        # ---------------------
+        # 2. Runtime feedback
+        # ---------------------
+
+        feedback = str(
+            session_state.get(
+                "feedback",
+                "",
+            )
+            or ""
+        ).strip()
+
         if feedback:
             sections.append(
                 "[上一轮反馈]\n"
                 + feedback
             )
-        # session memory
-        session_records = self.store.list_session(self.session_id)
+
+        query = " ".join(
+            (
+                node.title,
+                node.description,
+                node.acceptance,
+                node.tool,
+                node.context,
+            )
+        )
+
+        # ---------------------
+        # 3. Session Memory
+        # ---------------------
+
+        session_records = (
+            self.store.list_session(
+                self.session_id
+            )
+        )
+
+        # Direct dependency
+        # 已经注入，避免重复。
         session_records = [
             record
             for record
             in session_records
             if not (
-                record.kind == MemoryKind.TASK_RESULT
-                and record.source_task_id in dependency_task_ids
+                record.kind
+                == MemoryKind.TASK_RESULT
+                and record.source_task_id
+                in dependency_task_ids
             )
         ]
-        query = " ".join(
-            [
-                node.title,
-                node.description,
-                node.acceptance,
-                node.tool,
-            ]
-        )
 
-        relevant_session = self._relevant(
-            session_records,
-            query=query,
-            limit=self.session_limit,
+        relevant_session = (
+            self._relevant(
+                session_records,
+
+                query=query,
+
+                limit=(
+                    self.session_limit
+                ),
+            )
         )
 
         for record in relevant_session:
+
             sections.append(
                 "[Session Memory "
                 f"{record.kind.value}]\n"
                 f"{record.content}"
             )
-        
+
+        # ---------------------
+        # 4. Long-term Memory
+        # ---------------------
+
         if self.long_term_enabled:
-            long_term_records = self.store.list_long_term()
-            relevant_long_term = self._relevant(
-                long_term_records,
-                query=query,
-                limit=self.long_term_limit,
+
+            long_term_records = (
+                self.store
+                .list_long_term()
             )
-            for record in relevant_long_term:
+
+            relevant_long_term = (
+                self._relevant(
+                    long_term_records,
+
+                    query=query,
+
+                    limit=(
+                        self.long_term_limit
+                    ),
+                )
+            )
+
+            for record in (
+                relevant_long_term
+            ):
+
                 sections.append(
                     "[Long-term Memory "
                     f"{record.kind.value}]\n"
                     f"{record.content}"
                 )
-        return self._render_budgeted(sections)
+
+        return self._render_budgeted(
+            sections
+        )
+
+    # =========================
+    # Context Budget
+    # =========================
 
     def _render_budgeted(
         self,
         sections: list[str],
     ) -> str:
+
         if not sections:
             return ""
-        remaining = self.context_max_chars
-        result: list[str] = []
-        for section in sections:
-            if remaining <= 0:
-                break
-            if len(section) <= remaining:
-                result.append(section)
-                remaining -= len(section) + 2
-                continue
-            if remaining >= 80:
-                result.append(section[:remaining-30]+"\n...[Memory 截断]...")
-            break
-        return "\n\n".join(result)
 
+        remaining = (
+            self.context_max_chars
+        )
+
+        rendered: list[str] = []
+
+        for section in sections:
+
+            separator_cost = (
+                2
+                if rendered
+                else 0
+            )
+
+            available = (
+                remaining
+                - separator_cost
+            )
+
+            if available <= 0:
+                break
+
+            if len(section) <= available:
+
+                rendered.append(
+                    section
+                )
+
+                remaining -= (
+                    len(section)
+                    + separator_cost
+                )
+
+                continue
+
+            if available >= 80:
+
+                suffix = (
+                    "\n...[Memory 截断]..."
+                )
+
+                head_size = max(
+                    0,
+                    available
+                    - len(suffix)
+                )
+
+                rendered.append(
+                    section[:head_size]
+                    + suffix
+                )
+
+            break
+
+        return "\n\n".join(
+            rendered
+        )

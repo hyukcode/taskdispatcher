@@ -59,12 +59,17 @@ def artifact_record_from_dict(
             "artifact metadata "
             "must be an object"
         )
+    version = int(data.get("version", 0))
+    if version != ARTIFACT_VERSION:
+        raise ValueError(
+            f"Unsupported artifact version: {version}"
+        )
     record = ArtifactRecord(
-        version=int(data.get("version",0)),
+        version=version,
         id=str(data.get("id","")),
         session_id=str(data.get("session_id","")),
         source_task_id=str(data.get("source_task_id","")),
-        kind=ArtifactKind(str(data.get("kind",""))),
+        kind=ArtifactKind(str(data.get("kind",ArtifactKind.FILE.value))),
         name=str(data.get("name","")),
         media_type=str(data.get("media_type","text/plain")),
         relative_path=str(data.get("relative_path","")),
@@ -72,12 +77,6 @@ def artifact_record_from_dict(
         sha256=str(data.get("sha256","")),
         created_at=float(data.get("created_at",0.0)),
     )
-
-    if record.version != ARTIFACT_VERSION:
-        raise ValueError(
-            "unsupported artifact version: "
-            f"{record.version}"
-        )
 
     if not record.id:
         raise ValueError(

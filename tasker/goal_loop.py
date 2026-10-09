@@ -24,7 +24,8 @@ from .checkpoint_runtime import (
 from .execution_lease import LeaseHeldError
 from .memory_runtime import MemoryManager
 from .memory_store import MemoryStore
-
+from .artifact_store import ArtifactStore
+from .memory_maintenance import MemoryMaintenanceService
 
 logger = logging.getLogger(__name__)
 
@@ -583,10 +584,8 @@ class GoalLoop:
         workdir = str(workspace)
 
         def on_task_complete(run: TaskRun) -> None:
-
             if not persist_runs:
                 return
-
             with self._persist_lock:
                 # Session / TaskRun 事实源
                 session.task_runs[run.task.id] = task_run_to_dict(run)
@@ -601,12 +600,14 @@ class GoalLoop:
                         logger.exception(
                             "任务 %s Memory "
                             "写入失败",
-                            run.task.id,`
+                            run.task.id,
                         )
         
         checkpoint_coordinator = None
+        memory_store = None
         memory_manager = None
         artifact_store = None
+        maintenance = None
 
         if persist_runs and self.cfg.artifacts.enabled:
             artifact_store = ArtifactStore(
@@ -640,6 +641,11 @@ class GoalLoop:
                 context_max_chars=self.cfg.memory.context_max_chars,
                 long_term_enabled=self.cfg.memory.long_term_enabled,
             )
+            maintenance = MemoryMaintenanceService(
+                memory_store,
+                session_id=session.session_id,
+                artifact_store=artifact_store,
+            )
 
 
         ex = GraphExecutor(
@@ -659,7 +665,32 @@ class GoalLoop:
         )
         self.current = ex
         try:
-            return ex.execute()
+            runs = ex.execute()
+            # 整张图完成后再维护 Memory，不在每个 Task 后做 GC。
+            if maintenance is not None:
+                try:
+                    maintenance.run(
+                        max_task_results=(
+                            self.cfg.memory
+                            .max_task_results
+                        ),
+
+                        max_notes=(
+                            self.cfg.memory
+                            .max_notes
+                        ),
+
+                        artifact_grace_seconds=(
+                            self.cfg.memory
+                            .artifact_gc_grace_seconds
+                        ),
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Memory maintenance 失败"
+                    )
+            return runs
         finally:
             self.current = None
 

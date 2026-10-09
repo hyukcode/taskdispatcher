@@ -1,6 +1,7 @@
 import pytest
 
 from tasker.artifact_store import (
+    ArtifactCorrupted,
     ArtifactStore,
 )
 
@@ -8,54 +9,39 @@ from tasker.domain.artifact import (
     ArtifactKind,
 )
 
-from tasker.artifact_store import (
-    ArtifactCorrupted,
-)
 
-from tasker.domain.memory import (
-    MemoryKind,
-)
-
-from tasker.memory_runtime import (
-    MemoryManager,
-)
-
-from tasker.memory_store import (
-    MemoryStore,
-)
-
-from tasker.models import (
-    SubTask,
-    TaskRun,
-)
-
-
-def test_save_and_read_text(
-    tmp_path,
-):
-
-    workspace = (
-        tmp_path
-        / "workspace"
-        / "s1"
+def make_store(tmp_path):
+    return ArtifactStore(
+        workspace_root=(
+            tmp_path
+            / "workspace"
+            / "s1"
+        ),
+        session_id="s1",
     )
 
-    store = ArtifactStore(
-        workspace_root=workspace,
-        session_id="s1",
+
+def test_save_and_read_artifact(
+    tmp_path,
+):
+    store = make_store(
+        tmp_path
     )
 
     record = store.save_text(
         task_id="t1",
         name="result.txt",
         content="hello artifact",
-        kind=ArtifactKind.TASK_OUTPUT,
+        kind=(
+            ArtifactKind.TASK_OUTPUT
+        ),
     )
 
-    assert (
-        record.session_id
-        == "s1"
+    assert record.id.startswith(
+        "a-"
     )
+
+    assert record.session_id == "s1"
 
     assert (
         record.source_task_id
@@ -70,23 +56,17 @@ def test_save_and_read_text(
         )
     )
 
-    content = store.read_text(
-        record
+    assert (
+        store.read_text(record)
+        == "hello artifact"
     )
 
-    assert content == (
-        "hello artifact"
-    )
 
-def test_same_content_reuses_artifact(
+def test_same_content_is_idempotent(
     tmp_path,
 ):
-
-    store = ArtifactStore(
-        workspace_root=(
-            tmp_path / "s1"
-        ),
-        session_id="s1",
+    store = make_store(
+        tmp_path
     )
 
     first = store.save_text(
@@ -103,39 +83,91 @@ def test_same_content_reuses_artifact(
 
     assert first.id == second.id
 
-    records = store.list_for_task(
-        "t1"
-    )
+    assert len(
+        store.list_for_task(
+            "t1"
+        )
+    ) == 1
 
-    assert len(records) == 1
 
-
-def test_corrupted_payload_is_detected(
+def test_different_content_creates_different_artifact(
     tmp_path,
 ):
-
-    workspace = (
+    store = make_store(
         tmp_path
-        / "s1"
     )
 
-    store = ArtifactStore(
-        workspace_root=workspace,
-        session_id="s1",
+    first = store.save_text(
+        task_id="t1",
+        name="output.txt",
+        content="version one",
+    )
+
+    second = store.save_text(
+        task_id="t1",
+        name="output.txt",
+        content="version two",
+    )
+
+    assert (
+        first.id
+        != second.id
+    )
+
+    assert len(
+        store.list_for_task(
+            "t1"
+        )
+    ) == 2
+
+
+def test_read_can_be_truncated(
+    tmp_path,
+):
+    store = make_store(
+        tmp_path
     )
 
     record = store.save_text(
         task_id="t1",
-        name="output.txt",
+        name="large.txt",
+        content="A" * 1000,
+    )
+
+    content = store.read_text(
+        record,
+        max_chars=100,
+    )
+
+    assert content.startswith(
+        "A" * 100
+    )
+
+    assert (
+        "Artifact 截断"
+        in content
+    )
+
+
+def test_corrupted_payload_detected(
+    tmp_path,
+):
+    store = make_store(
+        tmp_path
+    )
+
+    record = store.save_text(
+        task_id="t1",
+        name="result.txt",
         content="original",
     )
 
-    payload = (
-        workspace
+    payload_path = (
+        store.workspace_root
         / record.relative_path
     )
 
-    payload.write_text(
+    payload_path.write_text(
         "tampered",
         encoding="utf-8",
     )
@@ -148,94 +180,92 @@ def test_corrupted_payload_is_detected(
         )
 
 
-
-def test_large_task_output_becomes_artifact(
+def test_missing_payload_detected(
     tmp_path,
 ):
-
-    session_root = (
-        tmp_path / "sessions"
-    )
-
-    workspace = (
+    store = make_store(
         tmp_path
-        / "workspace"
-        / "s1"
     )
 
-    memory_store = MemoryStore(
-        session_base=session_root,
-        long_term_base=(
-            tmp_path / "long"
-        ),
+    record = store.save_text(
+        task_id="t1",
+        name="result.txt",
+        content="hello",
     )
 
-    artifact_store = ArtifactStore(
-        workspace_root=workspace,
-        session_id="s1",
+    payload_path = (
+        store.workspace_root
+        / record.relative_path
     )
 
-    manager = MemoryManager(
-        memory_store,
+    payload_path.unlink()
 
-        session_id="s1",
+    with pytest.raises(
+        ArtifactCorrupted
+    ):
+        store.read_text(
+            record
+        )
 
-        artifact_store=(
-            artifact_store
-        ),
 
-        artifact_threshold_chars=1000,
-
-        artifact_preview_chars=200,
+def test_list_all(
+    tmp_path,
+):
+    store = make_store(
+        tmp_path
     )
 
-    task = SubTask(
-        id="t1",
-        title="分析仓库",
-        description="分析仓库代码",
+    store.save_text(
+        task_id="t1",
+        name="one.txt",
+        content="one",
     )
 
-    output = "A" * 5000
-
-    run = TaskRun(
-        task=task,
-        status="success",
-        output=output,
-        exit_code=0,
+    store.save_text(
+        task_id="t2",
+        name="two.txt",
+        content="two",
     )
 
-    memory = manager.record_task_run(
-        run
+    records = store.list_all()
+
+    assert len(records) == 2
+
+    assert {
+        record.source_task_id
+        for record in records
+    } == {
+        "t1",
+        "t2",
+    }
+
+
+def test_delete_artifact(
+    tmp_path,
+):
+    store = make_store(
+        tmp_path
     )
 
-    assert memory is not None
+    record = store.save_text(
+        task_id="t1",
+        name="delete.txt",
+        content="delete",
+    )
+
+    assert store.delete(
+        record
+    )
 
     assert (
-        memory.kind
-        == MemoryKind.TASK_RESULT
-    )
-
-    assert (
-        len(memory.artifact_ids)
-        == 1
-    )
-
-    assert len(memory.content) < 1500
-
-    artifact = (
-        artifact_store.load(
+        store.load(
             task_id="t1",
-            artifact_id=(
-                memory.artifact_ids[0]
-            ),
+            artifact_id=record.id,
         )
+        is None
     )
 
-    assert artifact is not None
-
-    assert (
-        artifact_store.read_text(
-            artifact
-        )
-        == output
+    assert not store.delete(
+        record
     )
+
