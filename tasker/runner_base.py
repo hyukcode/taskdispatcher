@@ -19,6 +19,8 @@ from .config import Config
 from .models import Event, TaskLoop, TaskRun
 from .policy_hooks import HookChain, HookContext, HookOutcome
 from .tool_catalog import ToolCatalog, ToolDecision
+from .tool_policy import ToolPolicy, ToolPolicyContext, ToolPolicyDecision
+from .tool_registry import default_tool_registry
 
 
 EventSink = Callable[[Optional[TaskRun], Event], None]
@@ -56,6 +58,7 @@ class RunnerBase(ABC):
         broker: ApprovalBroker | None = None,
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
+        tool_policy: ToolPolicy | None = None,
     ):
         self.cfg = cfg
         self.run = run
@@ -65,6 +68,12 @@ class RunnerBase(ABC):
         self.broker = broker or ApprovalBroker(cfg.approval)
         self.tool_catalog = tool_catalog
         self.hook_chain = hook_chain or HookChain()
+        self.tool_policy = tool_policy or ToolPolicy.from_config(
+            cfg,
+            registry=default_tool_registry(),
+            hook_chain=self.hook_chain,
+            strict_registry=False,
+        )
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -279,6 +288,78 @@ class RunnerBase(ABC):
 
     def approval_respond(self, req_id: str, allowed: bool) -> bool:
         return self.broker.resolve(req_id, allowed=allowed)
+
+    def authorize_tool(
+        self,
+        tool_name: str,
+        input_data: dict,
+    ) -> ToolPolicyDecision:
+
+        decision = (
+            self.tool_policy.authorize(
+                ToolPolicyContext(
+                    executor=(
+                        self.source
+                    ),
+                    task_id=(
+                        self.run.task.id
+                    ),
+                    attempt_id=(
+                        self.run.attempt_id
+                    ),
+                    tool_name=(
+                        str(
+                            tool_name
+                            or ""
+                        )
+                    ),
+                    input_data=(
+                        input_data
+                        if isinstance(
+                            input_data,
+                            dict,
+                        )
+                        else {}
+                    ),
+                    workspace_access=(
+                        self.run.task.workspace_access
+                    ),
+                    workdir_scope=(
+                        self.run.task.workdir_scope
+                    ),
+                    workdir=(
+                        self.workdir
+                    ),
+                )
+            )
+        )
+
+        # ToolPolicy 内 Hook 产生的 warning 在 Runner 事件层统一输出。
+        for warning in (
+            decision.warnings
+        ):
+            self._emit(
+                Event(
+                    kind="system",
+                    source="orchestrator",
+                    text=warning,
+                    data={
+                        "tool_policy": True,
+                        "tool": (
+                            decision
+                            .canonical_name
+                            or tool_name
+                        ),
+                        "action": (
+                            decision
+                            .action.value
+                        ),
+                    },
+                )
+            )
+
+        return decision
+        
 
     def tool_decision(self, tool_name: str) -> ToolDecision | None:
         """校验已知工具；未知工具交给后端自身的动态工具策略处理。"""

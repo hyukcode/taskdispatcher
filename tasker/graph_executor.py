@@ -28,6 +28,9 @@ from .checkpoint_runtime import (
 )
 from .memory_runtime import MemoryManager
 
+from .tool_policy import ToolPolicy
+from .tool_registry import ToolRegistry, default_tool_registry
+
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,8 @@ class GraphExecutor:
         on_task_complete=None,
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
+        tool_registry: ToolRegistry | None = None,
+        tool_policy: ToolPolicy | None = None,
         session_id: str = "",
         checkpoint_coordinator: CheckpointCoordinator | None = None,
         memory_manager: MemoryManager | None = None,
@@ -112,6 +117,38 @@ class GraphExecutor:
             str, list[TaskExecution]
         ] = {}
         self.memory = memory_manager
+        self.tool_catalog = (
+            tool_catalog
+            or ToolCatalog.from_config(
+                cfg
+            )
+        )
+
+        self.hook_chain = (
+            hook_chain
+            or HookChain.from_config(
+                cfg
+            )
+        )
+
+        self.tool_registry = (
+            tool_registry
+            or default_tool_registry()
+        )
+
+        self.tool_policy = (
+            tool_policy
+            or ToolPolicy.from_config(
+                cfg,
+                registry=(
+                    self.tool_registry
+                ),
+                hook_chain=(
+                    self.hook_chain
+                ),
+                strict_registry=False,
+            )
+        )
 
     @staticmethod
     def _default_emit(run: TaskRun | None, event: Event) -> None:
@@ -691,6 +728,7 @@ class GraphExecutor:
                 broker=self.broker,
                 tool_catalog=self.tool_catalog,
                 hook_chain=self.hook_chain,
+                tool_policy=self.tool_policy,
             )
 
         except ValueError as exc:

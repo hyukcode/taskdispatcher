@@ -14,6 +14,7 @@ from .models import Event, TaskRun
 from .policy_hooks import HookChain
 from .runner_base import EventSink, RunnerBase
 from .tool_catalog import ToolCatalog
+from .tool_policy import ToolPolicy 
 
 try:
     import claude_agent_sdk as sdk
@@ -38,6 +39,7 @@ class SdkClaudeRunner(RunnerBase):
         broker=None,
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
+        tool_policy: ToolPolicy | None = None,
     ):
         super().__init__(
             cfg,
@@ -48,6 +50,7 @@ class SdkClaudeRunner(RunnerBase):
             broker=broker,
             tool_catalog=tool_catalog,
             hook_chain=hook_chain,
+            tool_policy=tool_policy,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._client = None
@@ -165,46 +168,104 @@ class SdkClaudeRunner(RunnerBase):
             except Exception:
                 logger.debug("Claude SDK stop disconnect 失败", exc_info=True)
 
-    async def _can_use_tool(self, tool_name: str, input_data: dict, context) -> sdk.PermissionResult:
+    async def _can_use_tool(
+        self, 
+        tool_name: str, 
+        input_data: dict, 
+        context
+    ) -> sdk.PermissionResult:
         tool_use_id = (context.tool_use_id if context is not None else None) or str(time.time())
         mode = self.cfg.approval.mode
+        normalized_input = (
+            input_data
+            if isinstance(
+                input_data,
+                dict,
+            )
+            else {}
+        )
         req = Event(
             kind="permission_request",
             source=self.source,
-            text=f"{tool_name} {_compact(input_data, 120)}",
-            data={"tool": tool_name, "input": input_data, "id": tool_use_id, "tool_use_id": tool_use_id, "auto": mode == "auto"},
+            text=f"{tool_name} {_compact(normalized_input, 120)}",
+            data={"tool": tool_name, "input": normalized_input, "id": tool_use_id, "tool_use_id": tool_use_id, "auto": mode == "auto"},
         )
         self._emit(req)
+        # 统一 toolpolicy
+        decision = self.authorize_tool(
+            tool_name,
+            normalized_input,
+        )
+        # hook = self.before_tool(tool_name, input_data if isinstance(input_data, dict) else {})
+        if not decision.allowed:
+            self._permission_result(
+                req, 
+                False, 
+                decision.reason
+            )
+            return sdk.PermissionResultDeny(
+                message=decision.reason
+            )
 
-        hook = self.before_tool(tool_name, input_data if isinstance(input_data, dict) else {})
-        if not hook.allowed:
-            self._permission_result(req, False, hook.message)
-            return sdk.PermissionResultDeny(message=hook.message)
+        # policy = self.tool_decision(tool_name)
+        # if policy is not None and not policy.allowed:
+        #     self._permission_result(req, False, policy.reason)
+        #     return sdk.PermissionResultDeny(message=policy.reason)
 
-        policy = self.tool_decision(tool_name)
-        if policy is not None and not policy.allowed:
-            self._permission_result(req, False, policy.reason)
-            return sdk.PermissionResultDeny(message=policy.reason)
+        # 直接允许
+        if not decision.requires_approval:
+            self._permission_result(
+                req,
+                True,
+                decision.reason,
+            )
+            return sdk.PermissionResultAllow()
+
+        # REQUIRE_APPROVAL 只有这里才读取approval.mode
 
         if mode == "auto":
-            allowed = self.cfg.approval.default_allow
-            self._permission_result(req, allowed)
+            allowed = bool(self.cfg.approval.default_allow)
+            self._permission_result(
+                req, 
+                allowed,
+                decision.reason,
+            )
             return sdk.PermissionResultAllow() if allowed else sdk.PermissionResultDeny(message="auto 模式拒绝")
         if mode == "log":
             self._permission_result(req, False, "log 模式：仅记录，默认拒绝")
             return sdk.PermissionResultDeny(message="log 模式拒绝")
 
+        # ask_console
         loop = asyncio.get_running_loop()
         fut = loop.create_future()
 
-        def _resolve(allowed: bool, feedback: str) -> None:
+        def _resolve(
+            allowed: bool, 
+            feedback: str
+        ) -> None:
+            del feedback
             if not fut.done():
-                loop.call_soon_threadsafe(fut.set_result, allowed)
+                loop.call_soon_threadsafe(
+                    fut.set_result, 
+                    allowed,
+                )
 
-        self.broker.register_async(tool_use_id, kind="permission", run=self.run, event=req, resolver=_resolve)
+        self.broker.register_async(
+            tool_use_id, 
+            kind="permission", 
+            run=self.run, 
+            event=req, 
+            resolver=_resolve,
+        )
         try:
-            allowed = await asyncio.wait_for(fut, self.cfg.approval.timeout)
-        except (asyncio.TimeoutError, futures.TimeoutError):
+            allowed = await asyncio.wait_for(
+                fut, 
+                self.cfg.approval.timeout,
+            )
+        except (
+            asyncio.TimeoutError, 
+            futures.TimeoutError
+        ):
             allowed = False
         finally:
             self.broker.unregister(tool_use_id)

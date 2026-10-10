@@ -94,11 +94,14 @@ class ToolRegistry:
         tuple[str, str]
     ]:
 
-        names = {
-            self._normalize(name)
-            for name in spec.names
-            if self._normalize(name)
-        }
+        names: set[str] = set()
+
+        for name in spec.names:
+            normalized = self._normalize(name)
+            if not normalized:
+                continue
+            names.add(normalized)
+
 
         keys: set[tuple[str, str]] = set()
         for executor in spec.executors:

@@ -27,6 +27,7 @@ from .policy_hooks import HookChain
 from .runner_base import EventSink, RunnerBase
 from .spawn import ProcChannel, resolve_binary, start_process
 from .tool_catalog import ToolCatalog
+from .tool_policy import ToolPolicy
 
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,7 @@ class CodexAppServerRunner(RunnerBase):
         broker=None,
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
+        tool_policy: ToolPolicy | None = None,
     ):
         super().__init__(
             cfg,
@@ -92,6 +94,7 @@ class CodexAppServerRunner(RunnerBase):
             broker=broker,
             tool_catalog=tool_catalog,
             hook_chain=hook_chain,
+            tool_policy=tool_policy,
         )
         self.channel: ProcChannel | None = None
         self._rpc_id = 0
@@ -798,19 +801,62 @@ class CodexAppServerRunner(RunnerBase):
             "item/commandExecution/requestApproval": "run_command",
             "item/fileChange/requestApproval": "edit_file",
         }.get(method)
-        hook = self.before_tool(policy_tool, params) if policy_tool else None
-        if hook is not None and not hook.allowed:
-            self._decide_approval(msg, False, f"工具钩子拒绝：{hook.message}")
-            return
-        policy = self.tool_decision(policy_tool) if policy_tool else None
-        if policy is not None and not policy.allowed:
-            self._decide_approval(msg, False, f"工具策略拒绝：{policy.reason}")
-            return
+
+        # hook = self.before_tool(policy_tool, params) if policy_tool else None
+        # if hook is not None and not hook.allowed:
+        #     self._decide_approval(msg, False, f"工具钩子拒绝：{hook.message}")
+        #     return
+        # policy = self.tool_decision(policy_tool) if policy_tool else None
+        # if policy is not None and not policy.allowed:
+        #     self._decide_approval(msg, False, f"工具策略拒绝：{policy.reason}")
+        #     return
+
+        # ToolPolicy
+        if policy_tool:
+            decision = self.authorize_tool(
+                policy_tool,
+                params,
+            )
+            # deny
+            if not decision.allowed:
+                self._decide_approval(
+                    msg,
+                    False,
+                    (
+                        "ToolPolicy拒绝：",
+                        f"{decision.reason}"
+                    ),
+                )
+                return
+            # allow
+            if not decision.requires_approval:
+                self._decide_approval(
+                    msg,
+                    True,
+                    (
+                        "ToolPolicy 直接允许："
+                        f"{decision.reason}"
+                    ),
+                    auto=True,
+                )
+                return
 
         if mode == "auto":
-            self._decide_approval(msg, bool(self.cfg.approval.default_allow), "auto 模式", auto=True)
+            self._decide_approval(
+                msg, 
+                bool(self.cfg.approval.default_allow), 
+                "auto 模式", 
+                auto=True,
+            )
         elif mode == "log":
-            self._decide_approval(msg, False, "log 模式：仅记录，默认拒绝")
+            self._decide_approval(
+                msg, 
+                False, 
+                (
+                    "log 模式：仅记录，默认拒绝"
+                ),
+            )
+
         else:  # ask_console —— 阻塞 pump 等待 :allow/:deny
             got, allowed, _feedback = self.broker.wait_decision(rid, kind="permission", run=self.run, event=req)
             if got and allowed is not None:

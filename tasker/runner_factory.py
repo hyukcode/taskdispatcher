@@ -15,6 +15,7 @@ from .runner_base import EventSink, RunnerBase
 from .sdk_runner import SdkClaudeRunner
 from .policy_hooks import HookChain
 from .tool_catalog import ToolCatalog
+from .tool_policy import ToolPolicy
 
 
 RunnerType = Type[RunnerBase]
@@ -45,6 +46,7 @@ def create_runner(
     broker=None,
     tool_catalog: ToolCatalog | None = None,
     hook_chain: HookChain | None = None,
+    tool_policy: ToolPolicy | None = None,
 ) -> RunnerBase:
     """按 executor 创建统一 runner；调用方不需要知道具体协议类。"""
     return runner_type(executor)(
@@ -56,4 +58,5 @@ def create_runner(
         broker=broker,
         tool_catalog=tool_catalog,
         hook_chain=hook_chain,
+        tool_policy=tool_policy,
     )

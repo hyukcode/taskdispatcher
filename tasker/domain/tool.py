@@ -156,6 +156,38 @@ class ToolSpec:
             raise ValueError(
                 "tool name cannot be empty"
             )
+        
+        if isinstance(
+            self.aliases,
+            str,
+        ):
+            raise TypeError(
+                f"tool {self.name} aliases must be tuple[str, ...], not str"
+            )
+        
+        if not isinstance(
+            self.aliases,
+            tuple,
+        ):
+            raise TypeError(
+                f"tool {self.name} aliases must be tuple"
+            )
+        
+        if not all(
+            isinstance(alias, str)
+            for alias in self.aliases
+        ):
+            raise TypeError(
+                f"tool {self.name} aliases must contain only strings"
+            )
+
+        if any(
+            not alias.strip()
+            for alias in self.aliases
+        ):
+            raise ValueError(
+                f"tool {self.name} contains empty alias"
+            )
 
         if not self.executors:
             raise ValueError(
@@ -173,8 +205,7 @@ class ToolSpec:
             allowed_executors
         ):
             raise ValueError(
-                f"tool {self.name} "
-                "contains invalid executor"
+                f"tool {self.name} contains invalid executor"
             )
 
         allowed_scopes = {
@@ -184,8 +215,7 @@ class ToolSpec:
 
         if not self.workdir_scopes:
             raise ValueError(
-                f"tool {self.name} "
-                "requires workdir scope"
+                f"tool {self.name} requires workdir scope"
             )
 
         if not self.workdir_scopes.issubset(
@@ -207,9 +237,7 @@ class ToolSpec:
             }
         ):
             raise ValueError(
-                f"read-only tool "
-                f"{self.name} cannot "
-                "declare write side effect"
+                f"read-only tool {self.name} cannot declare write side effect"
             )
 
         if (
@@ -219,7 +247,5 @@ class ToolSpec:
             == ToolIdempotency.NON_IDEMPOTENT
         ):
             raise ValueError(
-                f"side-effect-free tool "
-                f"{self.name} cannot be "
-                "non-idempotent"
+                f"side-effect-free tool {self.name} cannot be non-idempotent"
             )

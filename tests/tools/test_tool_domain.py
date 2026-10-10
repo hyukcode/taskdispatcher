@@ -89,3 +89,25 @@ def test_names_contains_aliases():
         "read_file",
         "cat_file",
     )
+
+def test_aliases_cannot_be_plain_string():
+    with pytest.raises(TypeError):
+        ToolSpec(
+            name="Read",
+            aliases="read_file",
+        )
+
+def test_single_alias_tuple_is_valid():
+    spec=ToolSpec(
+        name="Read",
+        aliases=(
+            "read_file",
+        ),
+    )
+    assert spec.aliases == (
+        "read_file",
+    )
+    assert spec.names == (
+        "Read",
+        "read_file",
+    )

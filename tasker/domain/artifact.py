@@ -10,6 +10,7 @@ ARTIFACT_VERSION = 1
 class ArtifactKind(str, Enum):
     # Artifact 的业务类型
     TASK_OUTPUT = "task_output"
+    TOOL_OUTPUT = "tool_output"
     REPORT = "report"
     LOG = "log"
     FILE = "file"
