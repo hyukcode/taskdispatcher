@@ -184,6 +184,13 @@ class ArtifactConfig:
     threshold_chars: int = 3000
     preview_chars: int = 800
 
+@dataclass
+class ToolRuntimeConfig:
+    strict_registry: bool = False
+    max_retries: int = 1
+    initial_delay: float = 0.25
+    max_delay: float = 2.0
+    result_max_chars: int = 4000
 
 @dataclass
 class Config:
@@ -205,6 +212,9 @@ class Config:
     timeout_per_task: float = 900.0
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
+    tool_runtime: ToolRuntimeConfig = field(
+        default_factory=ToolRuntimeConfig
+    )
 
     def validate(self) -> "Config":
         """校验配置并在加载边界尽早报告错误。"""
@@ -418,6 +428,16 @@ class Config:
                 "artifacts.preview_chars "
                 "必须小于 threshold_chars"
             )
+
+        if self.tool_runtime.max_retries < 0:
+            raise ValueError("tool_runtime.max_retries 不能小于 0")
+        if self.tool_runtime.initial_delay < 0:
+            raise ValueError("tool_runtime.initial_delay 不能小于 0")
+        if self.tool_runtime.max_delay < self.tool_runtime.initial_delay:
+            raise ValueError("tool_runtime.max_delay 不能小于 initial_delay")
+        if self.tool_runtime.result_max_chars < 200:
+            raise ValueError("tool_runtime.result_max_chars 不能小于 200")
+
         return self
 
 

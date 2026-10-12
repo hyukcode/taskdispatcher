@@ -21,6 +21,7 @@ from .policy_hooks import HookChain, HookContext, HookOutcome
 from .tool_catalog import ToolCatalog, ToolDecision
 from .tool_policy import ToolPolicy, ToolPolicyContext, ToolPolicyDecision
 from .tool_registry import default_tool_registry
+from .tool_runtime import PreparedToolCall, ToolRuntime
 
 
 EventSink = Callable[[Optional[TaskRun], Event], None]
@@ -59,6 +60,7 @@ class RunnerBase(ABC):
         tool_catalog: ToolCatalog | None = None,
         hook_chain: HookChain | None = None,
         tool_policy: ToolPolicy | None = None,
+        tool_runtime: ToolRuntime | None = None,
     ):
         self.cfg = cfg
         self.run = run
@@ -74,6 +76,11 @@ class RunnerBase(ABC):
             hook_chain=self.hook_chain,
             strict_registry=False,
         )
+        self.tool_runtime=tool_runtime
+        self._prepared_tool_calls: dict[
+            str,
+            PreparedToolCall,
+        ] = {}
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -450,3 +457,104 @@ class RunnerBase(ABC):
         self.run.output = message
         self._result_ts = time.time()
         self._emit(Event(kind="error", source=self.source, text=message))
+
+    def prepare_tool_call(
+        self,
+        tool_name: str,
+        input_data: dict,
+        *,
+        external_call_id: str,
+    ) -> PreparedToolCall:
+
+        if self.tool_runtime is None:
+            raise RuntimeError(
+                "ToolRuntime not configured"
+            )
+
+        prepared = (
+            self.tool_runtime.prepare(
+                ToolPolicyContext(
+                    executor=self.source,
+                    task_id=(
+                        self.run.task.id
+                    ),
+                    attempt_id=(
+                        self.run.attempt_id
+                    ),
+                    tool_name=tool_name,
+                    input_data=(
+                        input_data
+                        if isinstance(
+                            input_data,
+                            dict,
+                        )
+                        else {}
+                    ),
+                    workspace_access=(
+                        self.run.task
+                        .workspace_access
+                    ),
+                    workdir_scope=(
+                        self.run.task
+                        .workdir_scope
+                    ),
+                    workdir=self.workdir,
+                ),
+                external_call_id=(
+                    external_call_id
+                ),
+            )
+        )
+
+        self._prepared_tool_calls[
+            external_call_id
+        ] = prepared
+
+        for warning in (
+            prepared
+            .decision
+            .warnings
+        ):
+
+            self._emit(
+                Event(
+                    kind="system",
+                    source="orchestrator",
+                    text=warning,
+                    data={
+                        "tool_policy": True,
+                    },
+                )
+            )
+
+        return prepared
+
+    def complete_tool_call(
+        self,
+        external_call_id: str,
+        *,
+        output,
+        is_error: bool,
+        metadata: dict | None = None,
+    ):
+
+        if self.tool_runtime is None:
+            return None
+        prepared = (
+            self._prepared_tool_calls.pop(
+                external_call_id,
+                None,
+            )
+        )
+        if prepared is None:
+            return None
+
+        return (
+            self.tool_runtime
+            .complete_backend(
+                prepared,
+                output=output,
+                is_error=is_error,
+                metadata=metadata,
+            )
+        )
